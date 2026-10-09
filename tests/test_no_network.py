@@ -21,8 +21,14 @@ def find_py_files(root: Path) -> list[Path]:
         # Ignore virtualenv, build artifacts, caches, and the test scanner itself
         if p.name == "test_no_network.py":
             continue
-        parts = [part.lower() for part in p.parts]
-        if any(ign in parts for ign in (".venv", "venv", "__pycache__", ".git", ".pytest_cache")):
+        # Chỉ quét mã của dự án: release/ và build/ chứa thư viện bên thứ ba do
+        # PyInstaller chép vào (onnxruntime có công cụ convert dùng requests,
+        # không bao giờ chạy trong app) ⇒ quét chúng làm build_exe.bat bị chặn.
+        parts = [part.lower() for part in p.relative_to(root).parts]
+        if any(
+            ign in parts
+            for ign in (".venv", "venv", "__pycache__", ".git", ".pytest_cache", "release", "build", "models", "tools")
+        ):
             continue
         py_files.append(p)
     return py_files

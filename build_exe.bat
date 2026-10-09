@@ -23,7 +23,8 @@ if errorlevel 1 (
 ".venv\Scripts\python.exe" -m PyInstaller main.py ^
     --name LogoEraser ^
     --onedir --windowed --noconfirm ^
-    --collect-all onnxruntime --collect-binaries nvidia ^
+    --collect-binaries onnxruntime --collect-binaries nvidia ^
+    --exclude-module onnxruntime.transformers --exclude-module onnxruntime.quantization ^
     --distpath release --workpath build --specpath build
 if errorlevel 1 (
     echo PyInstaller that bai.

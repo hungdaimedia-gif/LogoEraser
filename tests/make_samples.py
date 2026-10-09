@@ -93,3 +93,78 @@ def create_striped_sample(
     }
 
     return clean, corrupted, box_dict
+
+
+def create_synthetic_video(
+    output_path: str,
+    width: int = 320,
+    height: int = 240,
+    fps: int = 25,
+    duration: float = 3.0,
+    with_audio: bool = True,
+    logo_box: tuple[int, int, int, int] | None = None,
+    ffmpeg: str = "ffmpeg",
+) -> dict:
+    """Generate a synthetic test MP4 video using FFmpeg lavfi filters.
+
+    Returns a bounding box dict with unit='absolute'.
+    """
+    import subprocess
+    import sys
+
+    create_no_window = 0x08000000 if sys.platform == "win32" else 0
+
+    vf = "null"
+    box_dict = {"x": 20, "y": 20, "w": 60, "h": 40, "unit": "absolute"}
+    if logo_box is not None:
+        lx, ly, lw, lh = logo_box
+        vf = f"drawbox=x={lx}:y={ly}:w={lw}:h={lh}:color=yellow:t=fill"
+        box_dict = {"x": lx, "y": ly, "w": lw, "h": lh, "unit": "absolute"}
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc=size={width}x{height}:rate={fps}:duration={duration}",
+    ]
+
+    if with_audio:
+        cmd.extend([
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={duration}",
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            output_path,
+        ])
+    else:
+        cmd.extend([
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-an",
+            "-pix_fmt",
+            "yuv420p",
+            output_path,
+        ])
+
+    subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=create_no_window,
+    )
+    return box_dict

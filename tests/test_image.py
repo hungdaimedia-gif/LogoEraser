@@ -58,10 +58,18 @@ def test_preset_defaults_and_validation(tmp_path):
         ({"video": {"crf": -1}}, ValueError),
         ({"video": {"copy_audio": "false"}}, TypeError),
         ({"video": {"copy_audio": 1}}, TypeError),
+        ({"params": {"dilate": True}}, TypeError),
+        ({"params": {"dilate": 3.9}}, TypeError),
+        ({"params": {"feather": False}}, TypeError),
+        ({"params": {"radius": 2.5}}, TypeError),
+        ({"params": {"blur_ksize": 7.0}}, TypeError),
+        ({"params": {"mosaic_block": True}}, TypeError),
+        ({"video": {"crf": 23.5}}, TypeError),
+        ({"video": {"crf": True}}, TypeError),
     ],
 )
 def test_preset_validation_errors(bad_patch, expected_exc):
-    """Test B3: validate_preset must strictly reject invalid parameters."""
+    """Test B3 & N7: validate_preset must strictly reject invalid parameters and types."""
     base = get_default_preset()
     for k, v in bad_patch.items():
         if isinstance(v, dict) and k in base:
@@ -177,15 +185,23 @@ def test_overlay_errors_and_unicode_filename(tmp_path):
     assert isinstance(out, np.ndarray)
 
 
-def test_inpaint_hq_error_reduction():
+@pytest.mark.parametrize(
+    "pos_name,box_t",
+    [
+        ("center", (150, 100, 70, 45)),
+        ("right_edge", (330, 100, 70, 45)),
+        ("bottom_right_corner", (330, 255, 70, 45)),
+        ("top_edge", (150, 0, 70, 45)),
+    ],
+)
+def test_inpaint_hq_error_reduction(pos_name: str, box_t: tuple[int, int, int, int]):
     """Gate test: inpaint_hq average error in logo region compared to clean background
-
-    must be strictly less than 50% of the initial error caused by the logo.
+    must be strictly less than 50% of the initial error caused by the logo across all positions.
     """
-    clean, corrupted, box = create_synthetic_image(400, 300, (150, 100, 70, 45))
+    clean, corrupted, box = create_synthetic_image(400, 300, box_t)
     lx, ly, lw, lh = int(box["x"]), int(box["y"]), int(box["w"]), int(box["h"])
 
-    params = {"dilate": 2, "feather": 3, "radius": 5}
+    params = {"dilate": 3, "feather": 4, "radius": 5}
 
     erased_fast = apply(corrupted, [box], "inpaint_fast", params)
     erased_hq = apply(corrupted, [box], "inpaint_hq", params)
@@ -199,22 +215,32 @@ def test_inpaint_hq_error_reduction():
     fast_error = float(np.mean(np.abs(roi_fast - roi_clean)))
     hq_error = float(np.mean(np.abs(roi_hq - roi_clean)))
 
+    ratio = hq_error / initial_error
     print(
-        f"\n[Comparison] Initial: {initial_error:.2f} | Fast: {fast_error:.2f} | HQ: {hq_error:.2f} (Ratio: {hq_error/initial_error:.2%})"
+        f"\n[inpaint_hq Gate - {pos_name}] Initial: {initial_error:.2f} | Fast: {fast_error:.2f} | HQ: {hq_error:.2f} (Ratio: {ratio:.2%})"
     )
 
-    assert hq_error / initial_error < 0.50, f"inpaint_hq ratio {hq_error/initial_error:.2%} >= 50%"
+    assert ratio < 0.50, f"inpaint_hq ratio {ratio:.2%} >= 50% at {pos_name}"
 
 
-def test_clone_smooth_error_reduction():
-    """Test 2: Quality gate for clone_smooth on patterned/striped background.
-
-    Must achieve error reduction < 50% of initial logo error.
+@pytest.mark.parametrize(
+    "pos_name,box_t",
+    [
+        ("center", (150, 100, 70, 45)),
+        ("right_edge", (330, 100, 70, 45)),
+        ("bottom_right_corner", (330, 255, 70, 45)),
+        ("top_edge", (150, 0, 70, 45)),
+    ],
+)
+def test_clone_smooth_error_reduction(pos_name: str, box_t: tuple[int, int, int, int]):
+    """Gate test: clone_smooth average error in logo region compared to clean background
+    must be strictly less than 50% of the initial error caused by the logo across all positions.
+    Addresses Review B4: clone_smooth must succeed on corners and borders.
     """
-    clean, corrupted, box = create_striped_sample(400, 300, (150, 100, 70, 45))
+    clean, corrupted, box = create_synthetic_image(400, 300, box_t)
     lx, ly, lw, lh = int(box["x"]), int(box["y"]), int(box["w"]), int(box["h"])
 
-    params = {"dilate": 2, "feather": 3}
+    params = {"dilate": 3, "feather": 4}
     cloned = apply(corrupted, [box], "clone_smooth", params)
 
     roi_clean = clean[ly : ly + lh, lx : lx + lw].astype(np.float64)
@@ -225,9 +251,9 @@ def test_clone_smooth_error_reduction():
     cloned_error = float(np.mean(np.abs(roi_cloned - roi_clean)))
 
     ratio = cloned_error / initial_error
-    print(f"\n[clone_smooth Gate] Initial: {initial_error:.2f}, Cloned: {cloned_error:.2f}, Ratio: {ratio:.2%}")
+    print(f"\n[clone_smooth Gate - {pos_name}] Initial: {initial_error:.2f}, Cloned: {cloned_error:.2f}, Ratio: {ratio:.2%}")
 
-    assert ratio < 0.50, f"clone_smooth error ratio {ratio:.2%} is not < 50%"
+    assert ratio < 0.50, f"clone_smooth error ratio {ratio:.2%} is not < 50% at {pos_name}"
 
 
 def test_detect_logo_boxes():

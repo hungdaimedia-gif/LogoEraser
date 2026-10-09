@@ -207,11 +207,16 @@ def validate_preset(data: Any) -> Preset:
         if k not in known_top_keys:
             logger.warning("Ignoring unknown key in preset: %s", k)
 
-    # 1. Version check
-    raw_version = data.get("version", 1)
-    if not isinstance(raw_version, int) or raw_version != 1:
-        raise ValueError(f"Unsupported preset version {raw_version}. Only version 1 is supported.")
-    version = raw_version
+    # 1. Version check (strict integer, reject bool or float)
+    if "version" in data:
+        raw_version = data["version"]
+        if type(raw_version) is not int or raw_version != 1:
+            raise ValueError(
+                f"Unsupported preset version '{raw_version}'. Only version 1 (int) is supported."
+            )
+        version = raw_version
+    else:
+        version = 1
 
     # 2. Method check
     raw_method = data.get("method", "inpaint_hq")
@@ -233,8 +238,8 @@ def validate_preset(data: Any) -> Preset:
         for coord in ("x", "y", "w", "h"):
             if coord not in b:
                 raise ValueError(f"Box at index {idx} is missing '{coord}'")
-            if not isinstance(b[coord], (int, float)) or isinstance(b[coord], bool):
-                raise TypeError(f"Box at index {idx} '{coord}' must be numeric")
+            if type(b[coord]) not in (int, float):
+                raise TypeError(f"Box at index {idx} '{coord}' must be numeric (not {type(b[coord]).__name__})")
 
         w_val = float(b["w"])
         h_val = float(b["h"])
@@ -271,52 +276,46 @@ def validate_preset(data: Any) -> Preset:
             "unit": unit,
         })
 
-    # 4. Params check
+    # 4. Params check (N7: strict type check, reject bool or float for integer parameters)
     params_dict = data.get("params", {})
     if not isinstance(params_dict, dict):
         raise TypeError("Preset 'params' must be a dict")
 
     clean_params: PresetParams = dict(DEFAULT_PARAMS)
     for pk, pv in params_dict.items():
-        if pk == "dilate":
-            val = int(pv)
-            if val < 0:
-                raise ValueError(f"Parameter 'dilate' cannot be negative (got {val})")
-            clean_params["dilate"] = val
-        elif pk == "feather":
-            val = int(pv)
-            if val < 0:
-                raise ValueError(f"Parameter 'feather' cannot be negative (got {val})")
-            clean_params["feather"] = val
-        elif pk == "radius":
-            val = int(pv)
-            if val < 1:
-                raise ValueError(f"Parameter 'radius' must be >= 1 (got {val})")
-            clean_params["radius"] = val
-        elif pk == "blur_ksize":
-            val = int(pv)
-            if val < 3:
-                raise ValueError(f"Parameter 'blur_ksize' must be >= 3 (got {val})")
-            clean_params["blur_ksize"] = val
-        elif pk == "mosaic_block":
-            val = int(pv)
-            if val < 2:
-                raise ValueError(f"Parameter 'mosaic_block' must be >= 2 (got {val})")
-            clean_params["mosaic_block"] = val
+        if pk in ("dilate", "feather", "radius", "blur_ksize", "mosaic_block"):
+            if type(pv) is not int:
+                raise TypeError(f"Parameter '{pk}' must be an int, got {type(pv).__name__}")
+            if pk == "dilate" and pv < 0:
+                raise ValueError(f"Parameter 'dilate' cannot be negative (got {pv})")
+            if pk == "feather" and pv < 0:
+                raise ValueError(f"Parameter 'feather' cannot be negative (got {pv})")
+            if pk == "radius" and pv < 1:
+                raise ValueError(f"Parameter 'radius' must be >= 1 (got {pv})")
+            if pk == "blur_ksize" and pv < 3:
+                raise ValueError(f"Parameter 'blur_ksize' must be >= 3 (got {pv})")
+            if pk == "mosaic_block" and pv < 2:
+                raise ValueError(f"Parameter 'mosaic_block' must be >= 2 (got {pv})")
+            clean_params[pk] = pv  # type: ignore[literal-required]
+
         elif pk == "overlay_opacity":
+            if type(pv) not in (int, float):
+                raise TypeError(f"Parameter 'overlay_opacity' must be a float/int, got {type(pv).__name__}")
             val_f = float(pv)
             if val_f < 0.0 or val_f > 1.0:
                 raise ValueError(f"Parameter 'overlay_opacity' must be in [0.0, 1.0] (got {val_f})")
             clean_params["overlay_opacity"] = val_f
+
         elif pk == "solid_color":
-            parse_hex_color(str(pv))  # Validates #RRGGBB strictly
+            parse_hex_color(pv)  # Validates string and #RRGGBB strictly
             clean_params["solid_color"] = str(pv)
+
         elif pk == "overlay_path":
             clean_params["overlay_path"] = str(pv) if pv is not None else None
         else:
             logger.warning("Ignoring unknown parameter: %s", pk)
 
-    # 5. Video check
+    # 5. Video check (strict types)
     video_dict = data.get("video", {})
     if not isinstance(video_dict, dict):
         raise TypeError("Preset 'video' must be a dict")
@@ -338,12 +337,13 @@ def validate_preset(data: Any) -> Preset:
                 )
             clean_video["encoder"] = v_enc
         elif vk == "crf":
-            v_crf = int(vv)
-            if v_crf < 0 or v_crf > 51:
-                raise ValueError(f"video.crf must be in range [0, 51] (got {v_crf})")
-            clean_video["crf"] = v_crf
+            if type(vv) is not int:
+                raise TypeError(f"video.crf must be an integer, got {type(vv).__name__}")
+            if vv < 0 or vv > 51:
+                raise ValueError(f"video.crf must be in range [0, 51] (got {vv})")
+            clean_video["crf"] = vv
         elif vk == "copy_audio":
-            if not isinstance(vv, bool):
+            if type(vv) is not bool:
                 raise TypeError(
                     f"video.copy_audio must be a strict boolean (got {type(vv).__name__})"
                 )

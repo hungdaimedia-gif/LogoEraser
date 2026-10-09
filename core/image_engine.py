@@ -55,7 +55,7 @@ def build_mask(
 
 
 def _inpaint_fast(img: np.ndarray, mask: np.ndarray, radius: int) -> np.ndarray:
-    """Fast Telea inpainting."""
+    """Fast Telea inpainting using cv2.INPAINT_TELEA."""
     bin_mask = (mask > 10).astype(np.uint8) * 255
     r = max(1, int(radius))
     return cv2.inpaint(img, bin_mask, r, cv2.INPAINT_TELEA)
@@ -64,11 +64,11 @@ def _inpaint_fast(img: np.ndarray, mask: np.ndarray, radius: int) -> np.ndarray:
 def _inpaint_hq(
     img: np.ndarray, mask: np.ndarray, boxes_abs: list[dict], radius: int
 ) -> np.ndarray:
-    """Multi-scale dual-algorithm (Telea + Navier-Stokes) high quality inpainting.
+    """Dual-algorithm inpainting combining Telea and Navier-Stokes.
 
-    Combines weighted Laplacian continuation (NS) and boundary marching (Telea),
-    with multi-scale hierarchical reconstruction for large regions to eliminate
-    directional streak artifacts.
+    Runs cv2.INPAINT_TELEA and cv2.INPAINT_NS, blending them with weights
+    (0.45 Telea / 0.55 NS). For large boxes (>= 900 px or dimension >= 40 px),
+    executes an additional half-resolution pass to provide smooth low-frequency fill.
     """
     bin_mask = (mask > 10).astype(np.uint8) * 255
     r = max(1, int(radius))
@@ -122,15 +122,40 @@ def _clone_smooth(
 ) -> np.ndarray:
     """Seamless patch cloning from adjacent clean background regions.
 
-    Addresses Review B1: Expands the clone region beyond the logo boundary so that
-    seamlessClone samples boundary conditions from clean background pixels rather
-    than the logo edge.
+    Addresses Review B1 & B4:
+    Pre-inpaints target logo regions to ensure boundary conditions and reflective
+    padding (copyMakeBorder) remain free of logo artifacts even for corner/border logos.
+    Candidates for patch cloning are sourced strictly from uncorrupted regions within
+    the original image frame.
     """
-    out = img.copy()
-    h, w = img.shape[:2]
+    if not boxes_abs:
+        return img.copy()
 
-    # Margin to ensure boundary conditions lie completely outside the logo
-    margin = max(5, int(dilate) + 3)
+    h, w = img.shape[:2]
+    margin = max(6, int(dilate) + 4)
+
+    # Determine maximum dimension to ensure sufficient padding for candidate patches
+    max_dim = max([max(int(b["w"]), int(b["h"])) for b in boxes_abs], default=30)
+    pad = margin + max_dim + 4
+
+    # Pre-inpaint logo boxes so that boundary conditions at image borders and
+    # reflective padding do not mirror corrupt logo pixels.
+    pre_mask = np.zeros((h, w), dtype=np.uint8)
+    for b in boxes_abs:
+        bx = max(0, min(w - 1, int(b["x"])))
+        by = max(0, min(h - 1, int(b["y"])))
+        bw = max(1, min(w - bx, int(b["w"])))
+        bh = max(1, min(h - by, int(b["h"])))
+        pre_mask[by : by + bh, bx : bx + bw] = 255
+
+    if dilate > 0:
+        k_d = _odd(dilate * 2 + 1)
+        pre_mask = cv2.dilate(pre_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (k_d, k_d)))
+
+    base_img = cv2.inpaint(img, pre_mask, 5, cv2.INPAINT_TELEA)
+
+    # Pad base image with reflection so that border/corner logos have clean surrounding margin
+    padded = cv2.copyMakeBorder(base_img, pad, pad, pad, pad, cv2.BORDER_REFLECT_101)
 
     for i, b in enumerate(boxes_abs):
         bx = int(b["x"])
@@ -138,111 +163,93 @@ def _clone_smooth(
         bw = int(b["w"])
         bh = int(b["h"])
 
-        # Expanded box bounds
-        ebx = max(0, bx - margin)
-        eby = max(0, by - margin)
-        ebw = min(w - ebx, bw + 2 * margin)
-        ebh = min(h - eby, bh + 2 * margin)
+        # Coordinates inside padded image
+        pbx = bx + pad
+        pby = by + pad
 
-        if ebw < 4 or ebh < 4:
-            continue
+        # Expanded box bounds inside padded image
+        ebx = pbx - margin
+        eby = pby - margin
+        ebw = bw + 2 * margin
+        ebh = bh + 2 * margin
 
         other_boxes = [ob for j, ob in enumerate(boxes_abs) if j != i]
 
-        # Evaluate candidate neighbor patches: top, bottom, left, right
+        # Candidates MUST be located strictly inside the original unpadded image area:
+        # Original area inside padded is: X in [pad, pad + w], Y in [pad, pad + h]
         candidates: list[tuple[float, int, int]] = []
 
-        # 1. Top neighbor
-        if eby >= ebh:
-            candidate_box = {"x": ebx, "y": eby - ebh, "w": ebw, "h": ebh}
-            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
-                patch = out[eby - ebh:eby, ebx:ebx + ebw]
+        # 1. Top candidate: (ebx, eby - ebh)
+        if eby - ebh >= pad:
+            cand_orig = {"x": bx - margin, "y": by - margin - ebh, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(cand_orig, ob) for ob in other_boxes):
+                patch = padded[eby - ebh : eby, ebx : ebx + ebw]
                 var = float(np.var(patch))
                 candidates.append((var, ebx, eby - ebh))
 
-        # 2. Bottom neighbor
-        if eby + ebh + ebh <= h:
-            candidate_box = {"x": ebx, "y": eby + ebh, "w": ebw, "h": ebh}
-            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
-                patch = out[eby + ebh:eby + 2 * ebh, ebx:ebx + ebw]
+        # 2. Bottom candidate: (ebx, eby + ebh)
+        if eby + 2 * ebh <= pad + h:
+            cand_orig = {"x": bx - margin, "y": by - margin + ebh, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(cand_orig, ob) for ob in other_boxes):
+                patch = padded[eby + ebh : eby + 2 * ebh, ebx : ebx + ebw]
                 var = float(np.var(patch))
                 candidates.append((var, ebx, eby + ebh))
 
-        # 3. Left neighbor
-        if ebx >= ebw:
-            candidate_box = {"x": ebx - ebw, "y": eby, "w": ebw, "h": ebh}
-            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
-                patch = out[eby:eby + ebh, ebx - ebw:ebx]
+        # 3. Left candidate: (ebx - ebw, eby)
+        if ebx - ebw >= pad:
+            cand_orig = {"x": bx - margin - ebw, "y": by - margin, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(cand_orig, ob) for ob in other_boxes):
+                patch = padded[eby : eby + ebh, ebx - ebw : ebx]
                 var = float(np.var(patch))
                 candidates.append((var, ebx - ebw, eby))
 
-        # 4. Right neighbor
-        if ebx + ebw + ebw <= w:
-            candidate_box = {"x": ebx + ebw, "y": eby, "w": ebw, "h": ebh}
-            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
-                patch = out[eby:eby + ebh, ebx + ebw:ebx + 2 * ebw]
+        # 4. Right candidate: (ebx + ebw, eby)
+        if ebx + 2 * ebw <= pad + w:
+            cand_orig = {"x": bx - margin + ebw, "y": by - margin, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(cand_orig, ob) for ob in other_boxes):
+                patch = padded[eby : eby + ebh, ebx + ebw : ebx + 2 * ebw]
                 var = float(np.var(patch))
                 candidates.append((var, ebx + ebw, eby))
 
         if not candidates:
-            # Fallback to Telea inpainting if no clean neighbor patch fits
-            fallback_mask = np.zeros((h, w), dtype=np.uint8)
-            fallback_mask[by:by + bh, bx:bx + bw] = 255
-            if dilate > 0:
-                ksize = _odd(dilate * 2 + 1)
-                fallback_mask = cv2.dilate(
-                    fallback_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
-                )
-            out = cv2.inpaint(out, fallback_mask, 5, cv2.INPAINT_TELEA)
+            # Already pre-inpainted in base_img, so padded already has clean inpaint fallback
             continue
 
         # Choose patch with lowest variance
         candidates.sort(key=lambda item: item[0])
         _, src_x, src_y = candidates[0]
 
-        patch_src = out[src_y:src_y + ebh, src_x:src_x + ebw].copy()
+        patch_src = padded[src_y : src_y + ebh, src_x : src_x + ebw].copy()
 
-        # Build mask for seamlessClone inside expanded box:
-        # 0 at the boundary (clean background boundary condition)
-        # 255 at the interior logo location
+        # Build mask for seamlessClone inside expanded box
+        # Mask shape is (ebh, ebw). Outer boundary is 0, inner box is 255
         clone_mask = np.zeros((ebh, ebw), dtype=np.uint8)
-        inner_x = bx - ebx
-        inner_y = by - eby
-        inner_w = bw
-        inner_h = bh
-
-        # Ensure mask doesn't touch the outer boundary of the expanded patch
-        ix0 = max(2, inner_x)
-        iy0 = max(2, inner_y)
-        ix1 = min(ebw - 2, inner_x + inner_w)
-        iy1 = min(ebh - 2, inner_y + inner_h)
-
-        clone_mask[iy0:iy1, ix0:ix1] = 255
+        inner_x = margin
+        inner_y = margin
+        clone_mask[inner_y : inner_y + bh, inner_x : inner_x + bw] = 255
 
         if dilate > 0:
             ksize = _odd(dilate * 2 + 1)
             clone_mask = cv2.dilate(
                 clone_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
             )
-            # Ensure border remains 0
-            clone_mask[0:2, :] = 0
-            clone_mask[-2:, :] = 0
-            clone_mask[:, 0:2] = 0
-            clone_mask[:, -2:] = 0
 
         center = (ebx + ebw // 2, eby + ebh // 2)
 
         try:
-            out = cv2.seamlessClone(patch_src, out, clone_mask, center, cv2.NORMAL_CLONE)
-        except cv2.error:
+            padded = cv2.seamlessClone(patch_src, padded, clone_mask, center, cv2.NORMAL_CLONE)
+        except Exception:
             # Fallback to soft alpha blend with feathered mask
             k_f = _odd(feather * 2 + 1)
             soft = cv2.GaussianBlur(clone_mask, (k_f, k_f), 0).astype(np.float32) / 255.0
             soft = np.expand_dims(soft, axis=2)
-            roi = out[eby:eby + ebh, ebx:ebx + ebw].astype(np.float32)
-            blended = roi * (1.0 - soft) + patch_src.astype(np.float32) * soft
-            out[eby:eby + ebh, ebx:ebx + ebw] = np.clip(blended, 0, 255).astype(np.uint8)
+            roi = padded[eby : eby + ebh, ebx : ebx + ebw].astype(np.float32)
+            if roi.shape == patch_src.shape:
+                blended = roi * (1.0 - soft) + patch_src.astype(np.float32) * soft
+                padded[eby : eby + ebh, ebx : ebx + ebw] = np.clip(blended, 0, 255).astype(np.uint8)
 
+    # Crop padded image back to original dimensions
+    out = padded[pad : pad + h, pad : pad + w].copy()
     return out
 
 
@@ -437,7 +444,7 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
     # Candidate regions: static AND containing edge details
     candidates = cv2.bitwise_and(static_mask, edges)
 
-    # Tight morphological grouping (3x3 closing, no excessive dilation)
+    # Tight morphological grouping (5x5 closing, no excessive dilation)
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     grouped = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, k_close)
 
@@ -473,7 +480,6 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
         overlap = False
         for kept in filtered_boxes:
             iou = _compute_iou(b, kept)
-            # If IoU > 0.2 or b is largely contained within kept
             if iou > 0.2:
                 overlap = True
                 break

@@ -28,6 +28,28 @@ pytestmark = pytest.mark.gui
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def isolated_settings(tmp_path, monkeypatch):
+    # Không đọc/ghi settings.json thật của người dùng trong %APPDATA%
+    path = tmp_path / "settings" / "settings.json"
+    monkeypatch.setenv("LOGOERASER_SETTINGS", str(path))
+    return path
+
+
+def make_app(monkeypatch):
+    """Dựng một cửa sổ LogoEraserApp thật (dùng cho test mở lại app)."""
+    import gui.app as app_mod
+    from gui.theme import apply_dark_theme
+
+    root = tk.Tk()
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(app_mod.messagebox, name, lambda *a, **k: None)
+    apply_dark_theme(root)
+    a = app_mod.LogoEraserApp(root)
+    root.update()
+    return a
+
+
 @pytest.fixture
 def app(monkeypatch):
     try:
@@ -202,3 +224,63 @@ def test_param_controls_reach_preset_without_focus_out(app):
     assert preset["params"]["radius"] == 9
     assert preset["params"]["blur_ksize"] == 15
     assert preset["video"]["crf"] == 28
+
+
+def test_remembers_folders_after_restart(monkeypatch, tmp_path, isolated_settings):
+    try:
+        tk.Tk().destroy()
+    except tk.TclError as e:
+        pytest.skip(f"Tk unavailable: {e}")
+    import gui.app as app_mod
+
+    out_dir = tmp_path / "xuất kết quả"
+    in_dir = tmp_path / "ảnh gốc"
+    out_dir.mkdir()
+    in_dir.mkdir()
+    img = in_dir / "a.png"
+    cv2.imencode(".png", np.zeros((40, 40, 3), np.uint8))[1].tofile(str(img))
+
+    # Lần mở 1: chọn thư mục xuất + thêm tệp qua hộp thoại (giả lập lựa chọn của người dùng)
+    first = make_app(monkeypatch)
+    monkeypatch.setattr(app_mod.filedialog, "askdirectory", lambda **k: str(out_dir))
+    monkeypatch.setattr(app_mod.filedialog, "askopenfilenames", lambda **k: (str(img),))
+    first._on_browse_output_dir()
+    first._on_add_files()
+    first._on_close_window()  # đóng app ⇒ phải lưu ngay, không chờ hẹn giờ
+    assert isolated_settings.is_file()
+
+    # Lần mở 2: ô Thư mục xuất còn nguyên, hộp thoại mở đúng thư mục lần trước
+    seen: dict[str, str] = {}
+    second = make_app(monkeypatch)
+    assert second.out_dir_var.get() == str(out_dir)
+    monkeypatch.setattr(app_mod.filedialog, "askopenfilenames", lambda **k: seen.update(k) or ())
+    second._on_add_files()
+    assert os.path.normcase(seen["initialdir"]) == os.path.normcase(str(in_dir))
+    second.root.destroy()
+
+
+def test_forgotten_folder_falls_back(monkeypatch, tmp_path, isolated_settings):
+    try:
+        tk.Tk().destroy()
+    except tk.TclError as e:
+        pytest.skip(f"Tk unavailable: {e}")
+    from core.user_settings import save_settings
+
+    # Thư mục đã nhớ bị xoá/đổi tên (USB rút ra...) ⇒ không hiện đường dẫn chết
+    save_settings({"output_dir": str(tmp_path / "khong_con"), "input_dir": str(tmp_path / "cung_khong")})
+    a = make_app(monkeypatch)
+    assert a.out_dir_var.get() == ""
+    assert a._initial_dir("input_dir") is None
+    a.root.destroy()
+
+
+def test_corrupt_settings_file_does_not_break_app(monkeypatch, isolated_settings):
+    try:
+        tk.Tk().destroy()
+    except tk.TclError as e:
+        pytest.skip(f"Tk unavailable: {e}")
+    isolated_settings.parent.mkdir(parents=True, exist_ok=True)
+    isolated_settings.write_text("{hỏng", encoding="utf-8")
+    a = make_app(monkeypatch)
+    assert a.out_dir_var.get() == ""
+    a.root.destroy()

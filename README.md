@@ -48,6 +48,8 @@ Bản build Windows tải ở https://www.gyan.dev/ffmpeg/builds/ hoặc https:/
 
 Menu **Preset** dùng để lưu/mở cấu hình (Ctrl+S / Ctrl+L). File preset này dùng được luôn cho CLI.
 
+App tự **nhớ thư mục** bạn chọn lần trước: thư mục xuất, nơi mở ảnh/video, nơi lưu preset và nơi chọn ảnh phủ. Mở lại app là các mục này vẫn còn. Nếu một thư mục đã bị xoá hoặc đổi tên (ví dụ rút USB), app tự bỏ qua. Lựa chọn được lưu riêng cho từng tài khoản Windows, tại `%APPDATA%\LogoEraser\settings.json`.
+
 ## Các phương thức
 
 | Phương thức | Cách làm | Hợp với |

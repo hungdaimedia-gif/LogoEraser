@@ -23,6 +23,7 @@ from core import __version__
 from core.batch import is_clean_output, media_kind, output_path_for, process_file, read_image_safe
 from core.config import check_tools, load_config, tool_path
 from core.ai_inpaint import model_available
+from core.user_settings import existing_dir, load_settings, save_settings
 from core.preset import FAST_UNSUPPORTED_METHODS, SUPPORTED_METHODS, validate_preset
 from core.video_engine import extract_frame
 from gui.canvas import ImageCanvas
@@ -55,6 +56,9 @@ class LogoEraserApp(ttk.Frame):
         self._load_token: int = 0
 
         self.cfg = load_config()
+        # Ghi nhớ thư mục người dùng đã chọn giữa các lần mở app (%APPDATA%\LogoEraser)
+        self.settings = load_settings()
+        self._settings_save_job: str | None = None
 
         self._init_menu()
         self._init_ui()
@@ -169,7 +173,10 @@ class LogoEraserApp(ttk.Frame):
         out_frame.pack(fill=tk.X, pady=(4, 0))
 
         # Thư mục xuất mặc định lấy từ config.json (trống = cạnh file gốc)
-        self.out_dir_var = tk.StringVar(value=str(self.cfg.get("default_output_dir") or ""))
+        # Ưu tiên thư mục xuất lần trước; không còn tồn tại thì dùng mặc định trong config.json
+        start_out = existing_dir(self.settings["output_dir"]) or str(self.cfg.get("default_output_dir") or "")
+        self.out_dir_var = tk.StringVar(value=start_out)
+        self.out_dir_var.trace_add("write", lambda *_: self._remember("output_dir", self.out_dir_var.get().strip()))
         out_entry = ttk.Entry(out_frame, textvariable=self.out_dir_var)
         out_entry.pack(fill=tk.X, pady=(0, 4))
 
@@ -464,8 +471,10 @@ class LogoEraserApp(ttk.Frame):
         path = filedialog.askopenfilename(
             title="Chọn ảnh phủ (PNG RGBA)",
             filetypes=[("PNG Image", "*.png"), ("All files", "*.*")],
+            initialdir=self._initial_dir("overlay_dir"),
         )
         if path:
+            self._remember("overlay_dir", os.path.dirname(path))
             self.var_ov_path.set(path)
             self._on_param_changed("overlay_path", path)
 
@@ -478,16 +487,20 @@ class LogoEraserApp(ttk.Frame):
             ("Video", "*.mp4;*.mov;*.mkv;*.webm;*.avi"),
             ("Tất cả tệp", "*.*"),
         ]
-        chosen = filedialog.askopenfilenames(title="Chọn ảnh hoặc video", filetypes=file_types)
+        chosen = filedialog.askopenfilenames(
+            title="Chọn ảnh hoặc video", filetypes=file_types, initialdir=self._initial_dir("input_dir")
+        )
         if chosen:
+            self._remember("input_dir", os.path.dirname(chosen[0]))
             added = self.state.add_files(list(chosen))
             self._refresh_file_listbox()
             if added > 0 and self.canvas_widget.original_image is None:
                 self._load_file_to_canvas(self.state.files[0])
 
     def _on_add_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Chọn thư mục chứa ảnh/video")
+        folder = filedialog.askdirectory(title="Chọn thư mục chứa ảnh/video", initialdir=self._initial_dir("input_dir"))
         if folder:
+            self._remember("input_dir", folder)
             paths: list[str] = []
             for root, _, files in os.walk(folder):
                 for f in files:
@@ -591,8 +604,35 @@ class LogoEraserApp(ttk.Frame):
         self._on_boxes_changed()
         self.status_text_var.set(f"Đã mở: {os.path.basename(path)}")
 
+    # ==================== Ghi nhớ thư mục ====================
+
+    def _initial_dir(self, key: str) -> str | None:
+        """Thư mục mở sẵn cho hộp thoại: lần chọn trước, nếu thư mục còn tồn tại."""
+        return existing_dir(self.settings.get(key, "")) or None
+
+    def _remember(self, key: str, value: str) -> None:
+        """Nhớ lựa chọn; ghi file sau 500 ms (gõ tay đường dẫn không ghi từng phím)."""
+        if self.settings.get(key) == value:
+            return
+        self.settings[key] = value
+        if self._settings_save_job is not None:
+            self.root.after_cancel(self._settings_save_job)
+        self._settings_save_job = self.root.after(500, self._flush_settings)
+
+    def _flush_settings(self) -> None:
+        if self._settings_save_job is not None:
+            try:
+                self.root.after_cancel(self._settings_save_job)
+            except tk.TclError:
+                pass
+            self._settings_save_job = None
+        save_settings(self.settings)
+
     def _on_browse_output_dir(self) -> None:
-        folder = filedialog.askdirectory(title="Chọn thư mục xuất kết quả")
+        folder = filedialog.askdirectory(
+            title="Chọn thư mục xuất kết quả",
+            initialdir=existing_dir(self.out_dir_var.get().strip()) or self._initial_dir("input_dir"),
+        )
         if folder:
             self.out_dir_var.set(folder)
 
@@ -603,8 +643,10 @@ class LogoEraserApp(ttk.Frame):
             title="Lưu cấu hình Preset",
             defaultextension=".json",
             filetypes=[("JSON Preset", "*.json"), ("All files", "*.*")],
+            initialdir=self._initial_dir("preset_dir"),
         )
         if path:
+            self._remember("preset_dir", os.path.dirname(path))
             try:
                 self.state.save_preset_file(path)
                 self.status_text_var.set(f"Đã lưu preset: {os.path.basename(path)}")
@@ -616,8 +658,10 @@ class LogoEraserApp(ttk.Frame):
         path = filedialog.askopenfilename(
             title="Mở cấu hình Preset",
             filetypes=[("JSON Preset", "*.json"), ("All files", "*.*")],
+            initialdir=self._initial_dir("preset_dir"),
         )
         if path:
+            self._remember("preset_dir", os.path.dirname(path))
             try:
                 self.state.load_preset_file(path)
                 # Update GUI widgets with new state
@@ -845,6 +889,7 @@ class LogoEraserApp(ttk.Frame):
         Không đặt trần thời gian chờ: process_video cần thời gian terminate → kill
         tiến trình ffmpeg; destroy() sớm sẽ để lại ffmpeg mồ côi (REVIEW-2 N20).
         """
+        self._flush_settings()  # lưu thư mục đã chọn trước khi thoát
         if not self.is_processing:
             self.root.destroy()
             return

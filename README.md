@@ -1,6 +1,6 @@
-# LogoEraser
+# LogoEraser — by hungdaimedia
 
-Công cụ xoá / che logo và watermark **nhìn thấy được** trên ảnh và video. Chạy 100% offline trên Windows: không tài khoản, không quảng cáo, không gửi dữ liệu đi đâu.
+**LogoEraser** là sản phẩm của **hungdaimedia**: công cụ xoá / che logo và watermark **nhìn thấy được** trên ảnh và video. Chạy 100% offline trên Windows: không tài khoản, không quảng cáo, không gửi dữ liệu đi đâu.
 
 Có hai cách dùng, dùng chung một file preset `.json`:
 - **Giao diện (GUI):** vẽ vùng logo bằng chuột, xem trước, xử lý hàng loạt.
@@ -153,3 +153,9 @@ cli.py     dòng lệnh
 main.py    mở giao diện
 docs/dev/  kế hoạch và biên bản review của quá trình phát triển
 ```
+
+---
+
+**LogoEraser** © hungdaimedia · Phát triển và phát hành bởi **hungdaimedia** · [github.com/hungdaimedia-gif](https://github.com/hungdaimedia-gif)
+
+Thành phần bên thứ ba: OpenCV (Apache-2.0), NumPy (BSD), Pillow (MIT-CMU), ONNX Runtime (MIT), mô hình LaMa (Apache-2.0, bản ONNX của Carve/LaMa-ONNX), FFmpeg (LGPL/GPL, cài riêng).

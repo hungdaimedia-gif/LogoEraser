@@ -1,7 +1,7 @@
 """Preset configuration module for LogoEraser.
 
 Defines schemas, conversion routines between relative and absolute coordinates,
-validation, and JSON persistence used by both GUI and CLI workflows.
+strict validation, and JSON persistence used by both GUI and CLI workflows.
 """
 
 from __future__ import annotations
@@ -21,6 +21,30 @@ VALID_METHODS = {
     "solid",
     "overlay",
 }
+
+VALID_VIDEO_MODES = {"fast", "quality"}
+VALID_VIDEO_ENCODERS = {"auto", "h264_nvenc", "h264_qsv", "h264_amf", "libx264"}
+
+
+def parse_hex_color(hex_str: str) -> tuple[int, int, int]:
+    """Parse '#RRGGBB' into BGR uint8 tuple.
+
+    Raises:
+        TypeError: If hex_str is not a string.
+        ValueError: If hex_str does not match '#RRGGBB' format.
+    """
+    if not isinstance(hex_str, str):
+        raise TypeError(f"solid_color must be a string, got {type(hex_str).__name__}")
+    clean = hex_str.strip()
+    if not clean.startswith("#") or len(clean) != 7:
+        raise ValueError(f"Invalid solid_color '{hex_str}'. Expected format #RRGGBB.")
+    try:
+        r = int(clean[1:3], 16)
+        g = int(clean[3:5], 16)
+        b = int(clean[5:7], 16)
+    except ValueError as exc:
+        raise ValueError(f"Invalid hex characters in solid_color '{hex_str}'.") from exc
+    return (b, g, r)  # OpenCV BGR format
 
 
 class Box(TypedDict):
@@ -174,7 +198,7 @@ def to_rel_box(box: Box | dict[str, Any], frame_w: int, frame_h: int) -> Box:
 
 
 def validate_preset(data: Any) -> Preset:
-    """Validate and sanitize a preset structure, filling defaults for missing keys."""
+    """Validate and sanitize a preset structure strictly against PLAN specification."""
     if not isinstance(data, dict):
         raise TypeError(f"Preset must be a dict, got {type(data).__name__}")
 
@@ -183,8 +207,13 @@ def validate_preset(data: Any) -> Preset:
         if k not in known_top_keys:
             logger.warning("Ignoring unknown key in preset: %s", k)
 
-    version = int(data.get("version", 1))
+    # 1. Version check
+    raw_version = data.get("version", 1)
+    if not isinstance(raw_version, int) or raw_version != 1:
+        raise ValueError(f"Unsupported preset version {raw_version}. Only version 1 is supported.")
+    version = raw_version
 
+    # 2. Method check
     raw_method = data.get("method", "inpaint_hq")
     if not isinstance(raw_method, str) or raw_method not in VALID_METHODS:
         raise ValueError(
@@ -192,6 +221,7 @@ def validate_preset(data: Any) -> Preset:
         )
     method = raw_method
 
+    # 3. Boxes check
     raw_boxes = data.get("boxes", [])
     if not isinstance(raw_boxes, list):
         raise TypeError(f"Preset 'boxes' must be a list, got {type(raw_boxes).__name__}")
@@ -203,16 +233,35 @@ def validate_preset(data: Any) -> Preset:
         for coord in ("x", "y", "w", "h"):
             if coord not in b:
                 raise ValueError(f"Box at index {idx} is missing '{coord}'")
-            if not isinstance(b[coord], (int, float)):
+            if not isinstance(b[coord], (int, float)) or isinstance(b[coord], bool):
                 raise TypeError(f"Box at index {idx} '{coord}' must be numeric")
-            if float(b[coord]) < 0:
-                raise ValueError(f"Box at index {idx} '{coord}' cannot be negative")
+
+        w_val = float(b["w"])
+        h_val = float(b["h"])
+        x_val = float(b["x"])
+        y_val = float(b["y"])
+
+        if w_val <= 0 or h_val <= 0:
+            raise ValueError(f"Box at index {idx} w and h must be positive > 0 (got w={w_val}, h={h_val})")
 
         unit = str(b.get("unit", "relative")).lower()
         if unit not in ("relative", "absolute"):
             raise ValueError(
                 f"Box at index {idx} unit must be 'relative' or 'absolute', got '{unit}'"
             )
+
+        if unit == "relative":
+            if x_val < 0.0 or x_val > 1.0 or y_val < 0.0 or y_val > 1.0:
+                raise ValueError(f"Box at index {idx} relative coordinates must be in [0.0, 1.0]")
+            if w_val > 1.0 or h_val > 1.0:
+                raise ValueError(f"Box at index {idx} relative dimensions must be <= 1.0")
+            if (x_val + w_val) > 1.0001 or (y_val + h_val) > 1.0001:
+                raise ValueError(
+                    f"Box at index {idx} exceeds bounds: x+w={x_val+w_val:.3f}, y+h={y_val+h_val:.3f}"
+                )
+        else:
+            if x_val < 0 or y_val < 0:
+                raise ValueError(f"Box at index {idx} absolute coordinates cannot be negative")
 
         validated_boxes.append({
             "x": b["x"],
@@ -222,39 +271,83 @@ def validate_preset(data: Any) -> Preset:
             "unit": unit,
         })
 
-    # Validate parameters
+    # 4. Params check
     params_dict = data.get("params", {})
     if not isinstance(params_dict, dict):
         raise TypeError("Preset 'params' must be a dict")
 
     clean_params: PresetParams = dict(DEFAULT_PARAMS)
     for pk, pv in params_dict.items():
-        if pk in clean_params:
-            if pk in ("dilate", "feather", "radius", "blur_ksize", "mosaic_block"):
-                clean_params[pk] = int(pv)  # type: ignore[literal-required]
-            elif pk == "overlay_opacity":
-                clean_params[pk] = float(pv)  # type: ignore[literal-required]
-            elif pk == "solid_color":
-                clean_params[pk] = str(pv)  # type: ignore[literal-required]
-            elif pk == "overlay_path":
-                clean_params[pk] = str(pv) if pv is not None else None  # type: ignore[literal-required]
+        if pk == "dilate":
+            val = int(pv)
+            if val < 0:
+                raise ValueError(f"Parameter 'dilate' cannot be negative (got {val})")
+            clean_params["dilate"] = val
+        elif pk == "feather":
+            val = int(pv)
+            if val < 0:
+                raise ValueError(f"Parameter 'feather' cannot be negative (got {val})")
+            clean_params["feather"] = val
+        elif pk == "radius":
+            val = int(pv)
+            if val < 1:
+                raise ValueError(f"Parameter 'radius' must be >= 1 (got {val})")
+            clean_params["radius"] = val
+        elif pk == "blur_ksize":
+            val = int(pv)
+            if val < 3:
+                raise ValueError(f"Parameter 'blur_ksize' must be >= 3 (got {val})")
+            clean_params["blur_ksize"] = val
+        elif pk == "mosaic_block":
+            val = int(pv)
+            if val < 2:
+                raise ValueError(f"Parameter 'mosaic_block' must be >= 2 (got {val})")
+            clean_params["mosaic_block"] = val
+        elif pk == "overlay_opacity":
+            val_f = float(pv)
+            if val_f < 0.0 or val_f > 1.0:
+                raise ValueError(f"Parameter 'overlay_opacity' must be in [0.0, 1.0] (got {val_f})")
+            clean_params["overlay_opacity"] = val_f
+        elif pk == "solid_color":
+            parse_hex_color(str(pv))  # Validates #RRGGBB strictly
+            clean_params["solid_color"] = str(pv)
+        elif pk == "overlay_path":
+            clean_params["overlay_path"] = str(pv) if pv is not None else None
         else:
             logger.warning("Ignoring unknown parameter: %s", pk)
 
-    # Validate video settings
+    # 5. Video check
     video_dict = data.get("video", {})
     if not isinstance(video_dict, dict):
         raise TypeError("Preset 'video' must be a dict")
 
     clean_video: VideoSettings = dict(DEFAULT_VIDEO)
     for vk, vv in video_dict.items():
-        if vk in clean_video:
-            if vk == "crf":
-                clean_video[vk] = int(vv)  # type: ignore[literal-required]
-            elif vk == "copy_audio":
-                clean_video[vk] = bool(vv)  # type: ignore[literal-required]
-            elif vk in ("mode", "encoder"):
-                clean_video[vk] = str(vv)  # type: ignore[literal-required]
+        if vk == "mode":
+            v_mode = str(vv).lower()
+            if v_mode not in VALID_VIDEO_MODES:
+                raise ValueError(
+                    f"Invalid video.mode '{vv}'. Must be one of: {sorted(VALID_VIDEO_MODES)}"
+                )
+            clean_video["mode"] = v_mode
+        elif vk == "encoder":
+            v_enc = str(vv).lower()
+            if v_enc not in VALID_VIDEO_ENCODERS:
+                raise ValueError(
+                    f"Invalid video.encoder '{vv}'. Must be one of: {sorted(VALID_VIDEO_ENCODERS)}"
+                )
+            clean_video["encoder"] = v_enc
+        elif vk == "crf":
+            v_crf = int(vv)
+            if v_crf < 0 or v_crf > 51:
+                raise ValueError(f"video.crf must be in range [0, 51] (got {v_crf})")
+            clean_video["crf"] = v_crf
+        elif vk == "copy_audio":
+            if not isinstance(vv, bool):
+                raise TypeError(
+                    f"video.copy_audio must be a strict boolean (got {type(vv).__name__})"
+                )
+            clean_video["copy_audio"] = vv
         else:
             logger.warning("Ignoring unknown video setting: %s", vk)
 

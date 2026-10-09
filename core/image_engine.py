@@ -1,36 +1,23 @@
 """Pure image processing engine for LogoEraser.
 
 All functions are pure: they accept and return np.ndarray (BGR uint8)
-without performing file or network I/O.
+without performing file or network I/O (except reading overlay PNG via standard file system).
 """
 
 from __future__ import annotations
 
+import os
 import cv2
 import numpy as np
 from PIL import Image
 
-from .preset import VALID_METHODS, to_abs_box
+from .preset import VALID_METHODS, parse_hex_color, to_abs_box
 
 
 def _odd(n: int, minimum: int = 3) -> int:
     """Ensure integer n is odd and at least minimum."""
     v = max(int(n), minimum)
     return v if (v % 2 == 1) else (v + 1)
-
-
-def parse_hex_color(hex_str: str) -> tuple[int, int, int]:
-    """Parse '#RRGGBB' or 'RRGGBB' into BGR uint8 tuple."""
-    clean = hex_str.strip().lstrip("#")
-    if len(clean) != 6:
-        return (0, 0, 0)
-    try:
-        r = int(clean[0:2], 16)
-        g = int(clean[2:4], 16)
-        b = int(clean[4:6], 16)
-        return (b, g, r)  # OpenCV BGR format
-    except ValueError:
-        return (0, 0, 0)
 
 
 def build_mask(
@@ -41,6 +28,7 @@ def build_mask(
 ) -> np.ndarray:
     """Build a grayscale uint8 mask (0..255) from absolute bounding boxes.
 
+    Uses exact numpy slicing to prevent off-by-one pixel overflow.
     Applies dilation and soft Gaussian boundary feathering.
     """
     h, w = shape[:2]
@@ -51,7 +39,8 @@ def build_mask(
         by = max(0, min(h - 1, int(b["y"])))
         bw = max(1, min(w - bx, int(b["w"])))
         bh = max(1, min(h - by, int(b["h"])))
-        cv2.rectangle(mask, (bx, by), (bx + bw, by + bh), 255, -1)
+        # Exact numpy slicing: avoids OpenCV cv2.rectangle inclusive coordinate overflow
+        mask[by:by + bh, bx:bx + bw] = 255
 
     if dilate > 0:
         ksize = _odd(dilate * 2 + 1)
@@ -77,27 +66,27 @@ def _inpaint_hq(
 ) -> np.ndarray:
     """Multi-scale dual-algorithm (Telea + Navier-Stokes) high quality inpainting.
 
-    Combines weighted blends of NS and Telea, and performs multi-scale downscaled
-    reconstruction for large regions to prevent directional streak artifacts.
+    Combines weighted Laplacian continuation (NS) and boundary marching (Telea),
+    with multi-scale hierarchical reconstruction for large regions to eliminate
+    directional streak artifacts.
     """
     bin_mask = (mask > 10).astype(np.uint8) * 255
     r = max(1, int(radius))
 
-    # Base blend of Telea and Navier-Stokes
+    # Base dual-inpaint blend: NS preserves smooth gradients; Telea preserves edge sharpness
     base_telea = cv2.inpaint(img, bin_mask, r, cv2.INPAINT_TELEA)
     base_ns = cv2.inpaint(img, bin_mask, r, cv2.INPAINT_NS)
-    blended = cv2.addWeighted(base_telea, 0.5, base_ns, 0.5, 0.0)
+    blended = cv2.addWeighted(base_telea, 0.45, base_ns, 0.55, 0.0)
 
-    # Check if any box is large enough to benefit from multi-scale downscaled inpaint
+    # For regions with area >= 900 px or dimension >= 40px, use multi-scale low-frequency fill
     has_large_box = any(
-        (b.get("w", 0) >= 30 and b.get("h", 0) >= 30) or max(b.get("w", 0), b.get("h", 0)) >= 45
+        (b.get("w", 0) * b.get("h", 0) >= 900) or max(b.get("w", 0), b.get("h", 0)) >= 40
         for b in boxes_abs
     )
 
     if not has_large_box:
         return blended
 
-    # Multi-scale pass at half-resolution
     h, w = img.shape[:2]
     small_w = max(16, w // 2)
     small_h = max(16, h // 2)
@@ -121,72 +110,138 @@ def _inpaint_hq(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _clone_smooth(img: np.ndarray, boxes_abs: list[dict], feather: int) -> np.ndarray:
-    """Seamless patch cloning from adjacent background regions.
+def _boxes_intersect(b1: dict, b2: dict) -> bool:
+    """Check if two bounding boxes intersect."""
+    x1, y1, w1, h1 = b1["x"], b1["y"], b1["w"], b1["h"]
+    x2, y2, w2, h2 = b2["x"], b2["y"], b2["w"], b2["h"]
+    return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
 
-    Selects the neighbor direction with lowest variance and blends using cv2.seamlessClone.
+
+def _clone_smooth(
+    img: np.ndarray, boxes_abs: list[dict], dilate: int = 3, feather: int = 4
+) -> np.ndarray:
+    """Seamless patch cloning from adjacent clean background regions.
+
+    Addresses Review B1: Expands the clone region beyond the logo boundary so that
+    seamlessClone samples boundary conditions from clean background pixels rather
+    than the logo edge.
     """
     out = img.copy()
     h, w = img.shape[:2]
 
-    for b in boxes_abs:
-        bx = max(0, min(w - 2, int(b["x"])))
-        by = max(0, min(h - 2, int(b["y"])))
-        bw = max(2, min(w - bx, int(b["w"])))
-        bh = max(2, min(h - by, int(b["h"])))
+    # Margin to ensure boundary conditions lie completely outside the logo
+    margin = max(5, int(dilate) + 3)
+
+    for i, b in enumerate(boxes_abs):
+        bx = int(b["x"])
+        by = int(b["y"])
+        bw = int(b["w"])
+        bh = int(b["h"])
+
+        # Expanded box bounds
+        ebx = max(0, bx - margin)
+        eby = max(0, by - margin)
+        ebw = min(w - ebx, bw + 2 * margin)
+        ebh = min(h - eby, bh + 2 * margin)
+
+        if ebw < 4 or ebh < 4:
+            continue
+
+        other_boxes = [ob for j, ob in enumerate(boxes_abs) if j != i]
 
         # Evaluate candidate neighbor patches: top, bottom, left, right
         candidates: list[tuple[float, int, int]] = []
 
-        # Top neighbor
-        if by >= bh:
-            patch = out[by - bh:by, bx:bx + bw]
-            var = float(np.var(patch))
-            candidates.append((var, bx, by - bh))
+        # 1. Top neighbor
+        if eby >= ebh:
+            candidate_box = {"x": ebx, "y": eby - ebh, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
+                patch = out[eby - ebh:eby, ebx:ebx + ebw]
+                var = float(np.var(patch))
+                candidates.append((var, ebx, eby - ebh))
 
-        # Bottom neighbor
-        if by + bh + bh <= h:
-            patch = out[by + bh:by + bh + bh, bx:bx + bw]
-            var = float(np.var(patch))
-            candidates.append((var, bx, by + bh))
+        # 2. Bottom neighbor
+        if eby + ebh + ebh <= h:
+            candidate_box = {"x": ebx, "y": eby + ebh, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
+                patch = out[eby + ebh:eby + 2 * ebh, ebx:ebx + ebw]
+                var = float(np.var(patch))
+                candidates.append((var, ebx, eby + ebh))
 
-        # Left neighbor
-        if bx >= bw:
-            patch = out[by:by + bh, bx - bw:bx]
-            var = float(np.var(patch))
-            candidates.append((var, bx - bw, by))
+        # 3. Left neighbor
+        if ebx >= ebw:
+            candidate_box = {"x": ebx - ebw, "y": eby, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
+                patch = out[eby:eby + ebh, ebx - ebw:ebx]
+                var = float(np.var(patch))
+                candidates.append((var, ebx - ebw, eby))
 
-        # Right neighbor
-        if bx + bw + bw <= w:
-            patch = out[by:by + bh, bx + bw:bx + bw + bw]
-            var = float(np.var(patch))
-            candidates.append((var, bx + bw, by))
+        # 4. Right neighbor
+        if ebx + ebw + ebw <= w:
+            candidate_box = {"x": ebx + ebw, "y": eby, "w": ebw, "h": ebh}
+            if not any(_boxes_intersect(candidate_box, ob) for ob in other_boxes):
+                patch = out[eby:eby + ebh, ebx + ebw:ebx + 2 * ebw]
+                var = float(np.var(patch))
+                candidates.append((var, ebx + ebw, eby))
 
         if not candidates:
-            # Fallback to Telea if no candidate fits inside frame
-            box_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.rectangle(box_mask, (bx, by), (bx + bw, by + bh), 255, -1)
-            out = cv2.inpaint(out, box_mask, 5, cv2.INPAINT_TELEA)
+            # Fallback to Telea inpainting if no clean neighbor patch fits
+            fallback_mask = np.zeros((h, w), dtype=np.uint8)
+            fallback_mask[by:by + bh, bx:bx + bw] = 255
+            if dilate > 0:
+                ksize = _odd(dilate * 2 + 1)
+                fallback_mask = cv2.dilate(
+                    fallback_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+                )
+            out = cv2.inpaint(out, fallback_mask, 5, cv2.INPAINT_TELEA)
             continue
 
-        # Choose patch with minimum color variance
+        # Choose patch with lowest variance
         candidates.sort(key=lambda item: item[0])
         _, src_x, src_y = candidates[0]
 
-        patch_src = out[src_y:src_y + bh, src_x:src_x + bw].copy()
-        patch_mask = np.full((bh, bw), 255, dtype=np.uint8)
-        center = (bx + bw // 2, by + bh // 2)
+        patch_src = out[src_y:src_y + ebh, src_x:src_x + ebw].copy()
+
+        # Build mask for seamlessClone inside expanded box:
+        # 0 at the boundary (clean background boundary condition)
+        # 255 at the interior logo location
+        clone_mask = np.zeros((ebh, ebw), dtype=np.uint8)
+        inner_x = bx - ebx
+        inner_y = by - eby
+        inner_w = bw
+        inner_h = bh
+
+        # Ensure mask doesn't touch the outer boundary of the expanded patch
+        ix0 = max(2, inner_x)
+        iy0 = max(2, inner_y)
+        ix1 = min(ebw - 2, inner_x + inner_w)
+        iy1 = min(ebh - 2, inner_y + inner_h)
+
+        clone_mask[iy0:iy1, ix0:ix1] = 255
+
+        if dilate > 0:
+            ksize = _odd(dilate * 2 + 1)
+            clone_mask = cv2.dilate(
+                clone_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+            )
+            # Ensure border remains 0
+            clone_mask[0:2, :] = 0
+            clone_mask[-2:, :] = 0
+            clone_mask[:, 0:2] = 0
+            clone_mask[:, -2:] = 0
+
+        center = (ebx + ebw // 2, eby + ebh // 2)
 
         try:
-            out = cv2.seamlessClone(patch_src, out, patch_mask, center, cv2.NORMAL_CLONE)
+            out = cv2.seamlessClone(patch_src, out, clone_mask, center, cv2.NORMAL_CLONE)
         except cv2.error:
-            # Boundary or dimension error fallback
-            k_feather = _odd(feather * 2 + 1)
-            soft_mask = cv2.GaussianBlur(patch_mask, (k_feather, k_feather), 0)
-            alpha = np.expand_dims(soft_mask.astype(np.float32) / 255.0, axis=2)
-            roi = out[by:by + bh, bx:bx + bw].astype(np.float32)
-            blended = roi * (1.0 - alpha) + patch_src.astype(np.float32) * alpha
-            out[by:by + bh, bx:bx + bw] = np.clip(blended, 0, 255).astype(np.uint8)
+            # Fallback to soft alpha blend with feathered mask
+            k_f = _odd(feather * 2 + 1)
+            soft = cv2.GaussianBlur(clone_mask, (k_f, k_f), 0).astype(np.float32) / 255.0
+            soft = np.expand_dims(soft, axis=2)
+            roi = out[eby:eby + ebh, ebx:ebx + ebw].astype(np.float32)
+            blended = roi * (1.0 - soft) + patch_src.astype(np.float32) * soft
+            out[eby:eby + ebh, ebx:ebx + ebw] = np.clip(blended, 0, 255).astype(np.uint8)
 
     return out
 
@@ -204,7 +259,6 @@ def _apply_mosaic(
     img: np.ndarray, mask: np.ndarray, boxes_abs: list[dict], block_size: int
 ) -> np.ndarray:
     """Pixelate/mosaic transformation inside target boxes."""
-    out = img.copy()
     h, w = img.shape[:2]
     b_size = max(2, int(block_size))
 
@@ -238,18 +292,26 @@ def _apply_solid(img: np.ndarray, mask: np.ndarray, color_bgr: tuple[int, int, i
 def _apply_overlay(
     img: np.ndarray, boxes_abs: list[dict], overlay_path: str | None, opacity: float
 ) -> np.ndarray:
-    """Overlay PNG with alpha channel scaled into target boxes."""
-    if not overlay_path:
-        return img.copy()
+    """Overlay PNG with alpha channel scaled into target boxes.
 
-    try:
-        pil_ov = Image.open(overlay_path).convert("RGBA")
-    except Exception:
-        return img.copy()
+    Raises:
+        ValueError: If overlay_path is None/empty or opacity is out of range [0, 1].
+        FileNotFoundError: If overlay_path does not exist on disk.
+    """
+    if not overlay_path:
+        raise ValueError("overlay_path must be specified for 'overlay' method.")
+
+    if not os.path.isfile(overlay_path):
+        raise FileNotFoundError(f"Overlay image file not found: '{overlay_path}'")
+
+    user_opacity = float(opacity)
+    if user_opacity < 0.0 or user_opacity > 1.0:
+        raise ValueError(f"overlay_opacity must be in range [0.0, 1.0], got {user_opacity}")
+
+    pil_ov = Image.open(overlay_path).convert("RGBA")
 
     out = img.copy()
     h, w = img.shape[:2]
-    user_opacity = max(0.0, min(1.0, float(opacity)))
 
     for b in boxes_abs:
         bx = max(0, min(w - 1, int(b["x"])))
@@ -275,7 +337,8 @@ def apply(img: np.ndarray, boxes_abs: list[dict], method: str, params: dict) -> 
     """Apply one of the 7 logo erasure/covering methods to the image.
 
     Raises:
-        ValueError: If method is not one of the 7 supported methods.
+        ValueError: If method is not one of the 7 supported methods or params are invalid.
+        FileNotFoundError: If overlay image file is not found.
     """
     if method not in VALID_METHODS:
         raise ValueError(
@@ -302,7 +365,7 @@ def apply(img: np.ndarray, boxes_abs: list[dict], method: str, params: dict) -> 
         return _inpaint_hq(img, mask, clean_boxes, radius=radius)
 
     if method == "clone_smooth":
-        return _clone_smooth(img, clean_boxes, feather=feather)
+        return _clone_smooth(img, clean_boxes, dilate=dilate, feather=feather)
 
     if method == "blur":
         blur_ksize = int(params.get("blur_ksize", 31))
@@ -325,11 +388,31 @@ def apply(img: np.ndarray, boxes_abs: list[dict], method: str, params: dict) -> 
     raise ValueError(f"Unhandled method '{method}'")
 
 
+def _compute_iou(b1: dict, b2: dict) -> float:
+    """Compute Intersection over Union (IoU) of two boxes."""
+    x1 = max(b1["x"], b2["x"])
+    y1 = max(b1["y"], b2["y"])
+    x2 = min(b1["x"] + b1["w"], b2["x"] + b2["w"])
+    y2 = min(b1["y"] + b1["h"], b2["y"] + b2["h"])
+
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter_area = inter_w * inter_h
+
+    area1 = b1["w"] * b1["h"]
+    area2 = b2["w"] * b2["h"]
+    union_area = area1 + area2 - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
 def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict]:
     """Detect static watermark/logo bounding boxes across >= 8 video frames.
 
     Uses temporal variance combined with Canny edge density to pinpoint
     persistent static graphics or subtitles.
+    Includes Non-Maximum Suppression (NMS) to eliminate duplicate/nested bounding boxes.
     """
     if len(frames) < 8:
         return []
@@ -344,8 +427,8 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
     # Compute temporal standard deviation
     temporal_std = np.std(stack, axis=0)
 
-    # Static areas have low temporal standard deviation
-    static_mask = (temporal_std < 12.0).astype(np.uint8) * 255
+    # Static areas have low temporal standard deviation (< 10.0)
+    static_mask = (temporal_std < 10.0).astype(np.uint8) * 255
 
     # Edge density from average frame
     avg_gray = np.mean(stack, axis=0).astype(np.uint8)
@@ -354,15 +437,13 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
     # Candidate regions: static AND containing edge details
     candidates = cv2.bitwise_and(static_mask, edges)
 
-    # Morphological grouping
-    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9))
+    # Tight morphological grouping (3x3 closing, no excessive dilation)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     grouped = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, k_close)
-    k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    grouped = cv2.dilate(grouped, k_dilate, iterations=2)
 
     contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    boxes: list[dict] = []
+    raw_boxes: list[dict] = []
     for cnt in contours:
         bx, by, bw, bh = cv2.boundingRect(cnt)
         area = float(bw * bh)
@@ -371,10 +452,10 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
         if area > 0.25 * total_area:
             continue
         # Ignore tiny noise artifacts
-        if bw < 12 or bh < 12 or area < 150:
+        if bw < 8 or bh < 8 or area < 80:
             continue
 
-        boxes.append({
+        raw_boxes.append({
             "x": round(float(bx) / float(w), 4),
             "y": round(float(by) / float(h), 4),
             "w": round(float(bw) / float(w), 4),
@@ -383,11 +464,33 @@ def detect_logo_boxes(frames: list[np.ndarray], max_boxes: int = 3) -> list[dict
             "area": area,
         })
 
-    # Sort candidates by area descending
-    boxes.sort(key=lambda b: b["area"], reverse=True)
+    # Sort raw boxes by area descending
+    raw_boxes.sort(key=lambda b: b["area"], reverse=True)
+
+    # Non-Maximum Suppression (NMS) to merge overlapping or nested boxes
+    filtered_boxes: list[dict] = []
+    for b in raw_boxes:
+        overlap = False
+        for kept in filtered_boxes:
+            iou = _compute_iou(b, kept)
+            # If IoU > 0.2 or b is largely contained within kept
+            if iou > 0.2:
+                overlap = True
+                break
+            # Check containment
+            inter_x = max(b["x"], kept["x"])
+            inter_y = max(b["y"], kept["y"])
+            inter_w = max(0.0, min(b["x"] + b["w"], kept["x"] + kept["w"]) - inter_x)
+            inter_h = max(0.0, min(b["y"] + b["h"], kept["y"] + kept["h"]) - inter_y)
+            if (inter_w * inter_h) / (b["w"] * b["h"]) > 0.6:
+                overlap = True
+                break
+
+        if not overlap:
+            filtered_boxes.append(b)
 
     result = []
-    for b in boxes[:max_boxes]:
+    for b in filtered_boxes[:max_boxes]:
         result.append({
             "x": b["x"],
             "y": b["y"],

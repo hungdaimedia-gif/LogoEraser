@@ -12,15 +12,22 @@ from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
-VALID_METHODS = {
-    "inpaint_fast",
+# Thứ tự cố định để ô chọn phương thức trên GUI không đổi chỗ mỗi lần mở
+# (set của Python không giữ thứ tự giữa các lần chạy).
+SUPPORTED_METHODS: tuple[str, ...] = (
     "inpaint_hq",
+    "inpaint_fast",
     "clone_smooth",
     "blur",
     "mosaic",
     "solid",
     "overlay",
-}
+)
+VALID_METHODS = frozenset(SUPPORTED_METHODS)
+
+# Nguồn duy nhất cho đuôi file — CLI, GUI và core/batch.py đều import từ đây.
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi"})
 
 VALID_VIDEO_MODES = {"fast", "quality"}
 VALID_VIDEO_ENCODERS = {"auto", "h264_nvenc", "h264_qsv", "h264_amf", "libx264"}

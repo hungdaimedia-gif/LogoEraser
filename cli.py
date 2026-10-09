@@ -19,63 +19,17 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import cv2
-import numpy as np
-
-from core.config import load_config
-from core.image_engine import apply
-from core.preset import load_preset, to_abs_box, validate_preset
-from core.video_engine import process_video
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
-
-
-def read_image_safe(path: str) -> np.ndarray:
-    """Read image supporting Unicode and Vietnamese filesystem paths."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Image not found: '{path}'")
-    data = np.fromfile(path, dtype=np.uint8)
-    if data.size == 0:
-        raise ValueError(f"Empty image file: '{path}'")
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Failed to decode image from '{path}'")
-    return img
-
-
-def write_image_safe(path: str, img: np.ndarray) -> None:
-    """Write image supporting Unicode and Vietnamese filesystem paths."""
-    ext = os.path.splitext(path)[1].lower()
-    if not ext:
-        ext = ".png"
-    success, encoded = cv2.imencode(ext, img)
-    if not success:
-        raise ValueError(f"Failed to encode image to format '{ext}'")
-    encoded.tofile(path)
-
-
-def process_image_file(src: str, dst: str, preset: dict) -> None:
-    """Process a single image file via .part temporary file (Review 1b N12)."""
-    img = read_image_safe(src)
-    h, w = img.shape[:2]
-    abs_boxes = [to_abs_box(b, w, h) for b in preset["boxes"]]
-    out = apply(img, abs_boxes, preset["method"], preset["params"])
-    out_dir = os.path.dirname(dst)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    stem, ext = os.path.splitext(dst)
-    part_dst = f"{stem}.part{ext}"
-    try:
-        write_image_safe(part_dst, out)
-        os.replace(part_dst, dst)
-    finally:
-        if os.path.exists(part_dst):
-            try:
-                os.remove(part_dst)
-            except OSError:
-                pass
+from core.batch import (  # noqa: F401 — re-export cho code/test cũ import từ cli
+    is_clean_output,
+    media_kind,
+    part_path_for,
+    process_file,
+    process_image_file,
+    read_image_safe,
+    write_image_safe,
+)
+from core.config import check_tools, load_config, tool_path
+from core.preset import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, load_preset, validate_preset
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -114,8 +68,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Review 1b N13: Load config.json for custom ffmpeg/ffprobe paths
     cfg = load_config()
-    ffmpeg_bin = cfg.get("ffmpeg", "ffmpeg")
-    ffprobe_bin = cfg.get("ffprobe", "ffprobe")
+    ffmpeg_bin = tool_path(cfg, "ffmpeg")
+    ffprobe_bin = tool_path(cfg, "ffprobe")
 
     # 1. Load and validate preset
     try:
@@ -142,12 +96,9 @@ def main(argv: list[str] | None = None) -> int:
     output_path = os.path.abspath(args.output)
 
     if os.path.isfile(input_path):
-        ext = os.path.splitext(input_path)[1].lower()
-        if ext in IMAGE_EXTENSIONS:
-            ftype = "image"
-        elif ext in VIDEO_EXTENSIONS:
-            ftype = "video"
-        else:
+        ftype = media_kind(input_path)
+        if ftype is None:
+            ext = os.path.splitext(input_path)[1].lower()
             print(f"Error: Unsupported input file format '{ext}'", file=sys.stderr)
             return 1
 
@@ -165,18 +116,14 @@ def main(argv: list[str] | None = None) -> int:
             if not args.recursive and os.path.abspath(root) != input_path:
                 continue
             for f in files:
-                f_ext = os.path.splitext(f)[1].lower()
-                if f_ext in IMAGE_EXTENSIONS:
-                    ftype = "image"
-                elif f_ext in VIDEO_EXTENSIONS:
-                    ftype = "video"
-                else:
+                ftype = media_kind(f)
+                if ftype is None:
+                    continue
+                # Review 1b N15: Avoid processing previously created clean files (*_clean.*)
+                if is_clean_output(f):
                     continue
 
                 stem, ext_curr = os.path.splitext(f)
-                # Review 1b N15: Avoid processing previously created clean files (*_clean.*)
-                if stem.endswith("_clean"):
-                    continue
 
                 src_file = os.path.join(root, f)
                 rel_dir = os.path.relpath(root, input_path)
@@ -196,26 +143,18 @@ def main(argv: list[str] | None = None) -> int:
     success_count = 0
 
     for src, dst, ftype in tasks:
-        if os.path.exists(dst) and not args.overwrite:
-            failed_files.append((src, f"Destination file already exists (use --overwrite): '{dst}'"))
-            continue
-
         try:
-            if ftype == "image":
-                process_image_file(src, dst, valid_preset)
-            else:
-                process_video(src, dst, valid_preset, ffmpeg=ffmpeg_bin, ffprobe=ffprobe_bin)
+            process_file(
+                src,
+                dst,
+                valid_preset,
+                overwrite=args.overwrite,
+                ffmpeg=ffmpeg_bin,
+                ffprobe=ffprobe_bin,
+            )
             success_count += 1
             print(f"[OK] {src} -> {dst}")
         except Exception as e:
-            # Review 1b N12: Do not delete existing dst on failure; clean up partial .part file only
-            stem, ext = os.path.splitext(dst)
-            part_file = f"{stem}.part{ext}"
-            if os.path.exists(part_file):
-                try:
-                    os.remove(part_file)
-                except OSError:
-                    pass
             failed_files.append((src, str(e)))
             print(f"[FAIL] {src}: {e}", file=sys.stderr)
 

@@ -2,3 +2,14 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Đóng gói
+build/
+release/
+*.spec
+
+# FFmpeg đặt cục bộ để đóng gói kèm — không commit binary
+tools/
+
+# File sinh ra khi thử GUI
+scripts/samples/

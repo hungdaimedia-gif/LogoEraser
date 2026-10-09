@@ -138,6 +138,43 @@ def probe(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
     )
 
 
+def extract_frame(
+    src: str,
+    timestamp_sec: float = 0.0,
+    ffmpeg: str = "ffmpeg",
+    ffprobe: str = "ffprobe",
+) -> np.ndarray:
+    """Extract a single frame from video at given timestamp as BGR numpy array."""
+    info = probe(src, ffprobe=ffprobe)
+    cmd = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-ss",
+        str(timestamp_sec),
+        "-i",
+        src,
+        "-vframes",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-",
+    ]
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    frame_size = info.width * info.height * 3
+    if len(res.stdout) < frame_size:
+        raise ValueError(f"Failed to read complete frame of size {frame_size} from '{src}'")
+    return np.frombuffer(res.stdout[:frame_size], dtype=np.uint8).reshape((info.height, info.width, 3))
+
+
 @functools.lru_cache(maxsize=1)
 def detect_encoder(ffmpeg: str = "ffmpeg") -> str:
     """Detect the best available H.264 encoder on the current hardware/OS.

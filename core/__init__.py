@@ -1,5 +1,7 @@
 """LogoEraser core package."""
 
+__version__ = "1.0.0"
+
 from .preset import (
     Box,
     Preset,

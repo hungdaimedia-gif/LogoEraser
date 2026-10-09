@@ -72,6 +72,7 @@ def _get_session():
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.log_severity_level = 3  # chỉ báo lỗi; cảnh báo Memcpy của CUDA là bình thường với LaMa
         try:
             sess = ort.InferenceSession(str(path), so, providers=providers)
         except Exception as e:

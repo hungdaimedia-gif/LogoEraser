@@ -20,7 +20,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from core.image_engine import apply, build_mask
+from core.image_engine import apply_with_mask, build_mask
 from core.preset import to_abs_box, validate_preset
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class VideoInfo:
     nb_frames: int
     duration: float
     has_audio: bool
+    r_frame_rate: str = "25/1"
 
 
 def _parse_fps(fps_str: str) -> float:
@@ -99,7 +100,11 @@ def probe(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
 
     width = int(v_stream.get("width", 0))
     height = int(v_stream.get("height", 0))
-    fps = _parse_fps(v_stream.get("r_frame_rate", "") or v_stream.get("avg_frame_rate", "25/1"))
+
+    r_frame_rate = v_stream.get("r_frame_rate") or v_stream.get("avg_frame_rate") or "25/1"
+    if not r_frame_rate or r_frame_rate == "0/0":
+        r_frame_rate = "25/1"
+    fps = _parse_fps(r_frame_rate)
 
     # Duration from stream or container format
     dur_str = v_stream.get("duration") or data.get("format", {}).get("duration", "0")
@@ -129,6 +134,7 @@ def probe(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
         nb_frames=nb_frames,
         duration=duration,
         has_audio=has_audio,
+        r_frame_rate=r_frame_rate,
     )
 
 
@@ -171,6 +177,27 @@ def detect_encoder(ffmpeg: str = "ffmpeg") -> str:
 
     logger.info("Defaulting video encoder to libx264")
     return "libx264"
+
+
+def _build_encoder_args(encoder: str, crf: int) -> list[str]:
+    """Map encoder and CRF quality setting to appropriate FFmpeg encoder arguments.
+
+    Mapping (addresses Review 1b N9):
+        - libx264: -c:v libx264 -crf <crf> -preset medium
+        - h264_nvenc: -c:v h264_nvenc -rc vbr -cq <crf>
+        - h264_qsv: -c:v h264_qsv -global_quality <crf>
+        - h264_amf: -c:v h264_amf -rc cqp -qp_i <crf> -qp_p <crf>
+    """
+    crf_str = str(int(crf))
+    if encoder == "libx264":
+        return ["-c:v", "libx264", "-crf", crf_str, "-preset", "medium"]
+    elif encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", crf_str]
+    elif encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-global_quality", crf_str]
+    elif encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-rc", "cqp", "-qp_i", crf_str, "-qp_p", crf_str]
+    return ["-c:v", encoder]
 
 
 def process_video(
@@ -274,6 +301,10 @@ def _process_video_fast(
     if method == "clone_smooth":
         raise ValueError("clone_smooth is not supported in fast mode. Please use quality mode.")
 
+    # Review 1b N12: Write to temporary .part file to avoid corrupting/overwriting existing dst on failure
+    stem, ext = os.path.splitext(dst)
+    part_path = f"{stem}.part{ext}"
+
     cmd = [ffmpeg, "-y", "-v", "error", "-i", src]
     filter_args: list[str] = []
 
@@ -309,7 +340,8 @@ def _process_video_fast(
             c_out = f"c{i}"
             b_out = f"b{i}"
             v_next = f"v{i+1}"
-            fc_parts.append(f"[{cur_v}]split[{m_out}][c_out]")
+            # Review 1b B5: Use [{c_out}] instead of literal [c_out]
+            fc_parts.append(f"[{cur_v}]split[{m_out}][{c_out}]")
             fc_parts.append(f"[{c_out}]crop={bw}:{bh}:{bx}:{by},boxblur={r}:1:{r}:1[{b_out}]")
             fc_parts.append(f"[{m_out}][{b_out}]overlay={bx}:{by}[{v_next}]")
             cur_v = v_next
@@ -326,7 +358,8 @@ def _process_video_fast(
             c_out = f"c{i}"
             mos_out = f"mos{i}"
             v_next = f"v{i+1}"
-            fc_parts.append(f"[{cur_v}]split[{m_out}][c_out]")
+            # Review 1b B5: Use [{c_out}] instead of literal [c_out]
+            fc_parts.append(f"[{cur_v}]split[{m_out}][{c_out}]")
             scale_down = f"scale=max(2\\,iw/{block}):max(2\\,ih/{block})"
             scale_up = f"scale={bw}:{bh}:flags=neighbor"
             fc_parts.append(f"[{c_out}]crop={bw}:{bh}:{bx}:{by},{scale_down},{scale_up}[{mos_out}]")
@@ -357,11 +390,9 @@ def _process_video_fast(
 
     cmd.extend(filter_args)
 
-    # Video encoder settings
-    if encoder == "libx264":
-        cmd.extend(["-c:v", encoder, "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"])
-    else:
-        cmd.extend(["-c:v", encoder, "-pix_fmt", "yuv420p"])
+    # Video encoder settings with mapped CRF (Review 1b N9)
+    cmd.extend(_build_encoder_args(encoder, crf))
+    cmd.extend(["-pix_fmt", "yuv420p"])
 
     # Audio handling
     if copy_audio:
@@ -372,7 +403,7 @@ def _process_video_fast(
     else:
         cmd.append("-an")
 
-    cmd.extend(["-progress", "pipe:1", dst])
+    cmd.extend(["-progress", "pipe:1", part_path])
 
     proc = subprocess.Popen(
         cmd,
@@ -392,36 +423,57 @@ def _process_video_fast(
     t_err.start()
 
     total_sec = info.duration if info.duration > 0.0 else (info.nb_frames / info.fps if info.fps > 0 else 1.0)
+    cancelled = False
 
     try:
         if proc.stdout:
             for line_bytes in proc.stdout:
                 if cancel and cancel.is_set():
-                    proc.terminate()
+                    cancelled = True
                     break
                 line_str = line_bytes.decode("utf-8", errors="replace").strip()
-                if line_str.startswith("out_time_ms="):
+                # Review 1b N11: out_time_us is microseconds, out_time_ms in FFmpeg progress is also microseconds
+                if line_str.startswith("out_time_us=") or line_str.startswith("out_time_ms="):
                     try:
-                        ms = int(line_str.split("=", 1)[1])
-                        current_sec = ms / 1_000_000.0 if ms > 1_000_000 else ms / 1000.0
+                        us = int(line_str.split("=", 1)[1])
+                        current_sec = us / 1_000_000.0
                         if progress_cb and total_sec > 0.0:
                             progress_cb(current_sec, total_sec)
                     except ValueError:
                         pass
     finally:
-        proc.wait()
+        if cancelled or (cancel and cancel.is_set()):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+        else:
+            proc.wait()
         t_err.join(timeout=2.0)
 
-    if cancel and cancel.is_set():
-        if os.path.exists(dst):
-            os.remove(dst)
+    if cancelled or (cancel and cancel.is_set()):
+        if os.path.exists(part_path):
+            os.remove(part_path)
         raise RuntimeError("Video processing was cancelled.")
 
     if proc.returncode != 0:
-        if os.path.exists(dst):
-            os.remove(dst)
+        if os.path.exists(part_path):
+            os.remove(part_path)
         last_err = "".join(stderr_lines[-20:])
         raise RuntimeError(f"FFmpeg fast mode failed (exit code {proc.returncode}):\n{last_err}")
+
+    # Success: atomically move part file to final destination (Review 1b N12)
+    os.replace(part_path, dst)
 
 
 def _process_video_quality(
@@ -445,6 +497,10 @@ def _process_video_quality(
         if not ov_path or not os.path.isfile(ov_path):
             raise FileNotFoundError(f"Overlay image file not found: '{ov_path}'")
 
+    # Review 1b N12: Write to temporary .part file to avoid corrupting/overwriting existing dst on failure
+    stem, ext = os.path.splitext(dst)
+    part_path = f"{stem}.part{ext}"
+
     dec_cmd = [
         ffmpeg,
         "-v",
@@ -458,6 +514,7 @@ def _process_video_quality(
         "-",
     ]
 
+    # Review 1b N14: Preserve exact frame rate string (e.g. '30000/1001') to avoid audio desync
     enc_cmd = [
         ffmpeg,
         "-y",
@@ -470,7 +527,7 @@ def _process_video_quality(
         "-s",
         f"{info.width}x{info.height}",
         "-r",
-        str(info.fps),
+        info.r_frame_rate,
         "-i",
         "-",
     ]
@@ -480,10 +537,9 @@ def _process_video_quality(
     else:
         enc_cmd.append("-an")
 
-    if encoder == "libx264":
-        enc_cmd.extend(["-c:v", encoder, "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p", dst])
-    else:
-        enc_cmd.extend(["-c:v", encoder, "-pix_fmt", "yuv420p", dst])
+    # Review 1b N9: Map CRF to encoder quality parameters
+    enc_cmd.extend(_build_encoder_args(encoder, crf))
+    enc_cmd.extend(["-pix_fmt", "yuv420p", part_path])
 
     dec_proc = subprocess.Popen(
         dec_cmd,
@@ -518,15 +574,22 @@ def _process_video_quality(
     t_dec_err.start()
     t_enc_err.start()
 
+    # Review 1b N10: Precompute binary mask once to avoid recomputing build_mask on every frame
+    dilate = int(params.get("dilate", 3))
+    feather = int(params.get("feather", 4))
+    mask = build_mask((info.height, info.width), abs_boxes, dilate=dilate, feather=feather)
+
     frame_size = info.width * info.height * 3
     frame_idx = 0
     total_frames = info.nb_frames if info.nb_frames > 0 else int(round(info.duration * info.fps))
     cancelled = False
+    aborted_early = False
 
     try:
         while True:
             if cancel and cancel.is_set():
                 cancelled = True
+                aborted_early = True
                 break
 
             assert dec_proc.stdout is not None
@@ -539,45 +602,104 @@ def _process_video_quality(
 
             # Review 1b Note 4: apply error halts job and cleans up corrupt output
             try:
-                processed = apply(frame, abs_boxes, method, params)
+                processed = apply_with_mask(frame, mask, abs_boxes, method, params)
             except Exception as apply_exc:
-                dec_proc.terminate()
-                enc_proc.terminate()
-                dec_proc.wait()
-                enc_proc.wait()
-                if os.path.exists(dst):
-                    os.remove(dst)
+                aborted_early = True
                 raise apply_exc
 
             assert enc_proc.stdin is not None
             try:
                 enc_proc.stdin.write(processed.tobytes())
             except (BrokenPipeError, OSError):
+                aborted_early = True
                 break
 
             frame_idx += 1
             if progress_cb and total_frames > 0:
                 progress_cb(frame_idx, total_frames)
 
-    finally:
-        if enc_proc.stdin:
-            try:
-                enc_proc.stdin.close()
-            except Exception:
-                pass
+    except Exception:
+        aborted_early = True
+        raise
 
-        dec_proc.wait()
-        enc_proc.wait()
+    finally:
+        # Review 1b B6: If aborted early (cancel/error/broken pipe), terminate decoder first to unblock pipes
+        if aborted_early or cancelled or (cancel and cancel.is_set()):
+            try:
+                dec_proc.terminate()
+            except OSError:
+                pass
+            try:
+                enc_proc.terminate()
+            except OSError:
+                pass
+            if dec_proc.stdout:
+                try:
+                    dec_proc.stdout.close()
+                except OSError:
+                    pass
+            if enc_proc.stdin:
+                try:
+                    enc_proc.stdin.close()
+                except OSError:
+                    pass
+
+            for p in (dec_proc, enc_proc):
+                try:
+                    p.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+        else:
+            # Normal completion
+            if enc_proc.stdin:
+                try:
+                    enc_proc.stdin.close()
+                except OSError:
+                    pass
+            if dec_proc.stdout:
+                try:
+                    dec_proc.stdout.close()
+                except OSError:
+                    pass
+
+            dec_proc.wait()
+            enc_proc.wait()
+
         t_dec_err.join(timeout=2.0)
         t_enc_err.join(timeout=2.0)
 
     if cancelled or (cancel and cancel.is_set()):
-        if os.path.exists(dst):
-            os.remove(dst)
+        if os.path.exists(part_path):
+            os.remove(part_path)
         raise RuntimeError("Video processing was cancelled.")
 
+    # Review 1b N8: Verify both decoder and encoder exit codes
+    if dec_proc.returncode not in (0, None):
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        err_msg = "".join(dec_err_lines[-20:])
+        raise RuntimeError(f"FFmpeg decoder failed (code {dec_proc.returncode}):\n{err_msg}")
+
     if enc_proc.returncode != 0:
-        if os.path.exists(dst):
-            os.remove(dst)
+        if os.path.exists(part_path):
+            os.remove(part_path)
         err_msg = "".join(enc_err_lines[-20:])
         raise RuntimeError(f"FFmpeg quality encoder failed (code {enc_proc.returncode}):\n{err_msg}")
+
+    # Review 1b N8: Warn if processed frame count deviates by > 2% from stream header
+    if total_frames > 50 and abs(frame_idx - total_frames) > 0.02 * total_frames:
+        logger.warning(
+            "Processed frame count (%d) deviates by more than 2%% from expected (%d)",
+            frame_idx,
+            total_frames,
+        )
+
+    # Success: atomically move part file to final destination (Review 1b N12)
+    os.replace(part_path, dst)

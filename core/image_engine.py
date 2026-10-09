@@ -358,10 +358,30 @@ def apply(img: np.ndarray, boxes_abs: list[dict], method: str, params: dict) -> 
     h, w = img.shape[:2]
     # Ensure all boxes are absolute
     clean_boxes = [to_abs_box(b, w, h) for b in boxes_abs]
-
     dilate = int(params.get("dilate", 3))
     feather = int(params.get("feather", 4))
     mask = build_mask(img.shape, clean_boxes, dilate=dilate, feather=feather)
+    return apply_with_mask(img, mask, clean_boxes, method, params)
+
+
+def apply_with_mask(
+    img: np.ndarray,
+    mask: np.ndarray,
+    clean_boxes: list[dict],
+    method: str,
+    params: dict,
+) -> np.ndarray:
+    """Apply erasure method using a precomputed binary mask.
+
+    Used by the quality video processing pipeline to avoid recomputing masks per frame.
+    """
+    if method not in VALID_METHODS:
+        raise ValueError(
+            f"Invalid method '{method}'. Supported methods: {sorted(list(VALID_METHODS))}"
+        )
+
+    if not clean_boxes:
+        return img.copy()
 
     if method == "inpaint_fast":
         radius = int(params.get("radius", 5))
@@ -372,6 +392,8 @@ def apply(img: np.ndarray, boxes_abs: list[dict], method: str, params: dict) -> 
         return _inpaint_hq(img, mask, clean_boxes, radius=radius)
 
     if method == "clone_smooth":
+        dilate = int(params.get("dilate", 3))
+        feather = int(params.get("feather", 4))
         return _clone_smooth(img, clean_boxes, dilate=dilate, feather=feather)
 
     if method == "blur":

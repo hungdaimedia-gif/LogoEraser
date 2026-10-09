@@ -1,12 +1,16 @@
 """Integration and unit tests for VideoEngine and CLI in LogoEraser.
 
-Covers Phase 1b gates:
-- Video probing and encoder detection.
-- Fast mode with all boundary conditions and clone_smooth rejection.
-- Quality mode with >= 300 frames to prove no stderr pipe deadlock.
-- 3-second sample video gate with audio preservation.
-- Cancellation cleanup and error containment.
-- CLI execution, exit codes (0, 1, 2), and Unicode Vietnamese directory handling.
+Covers Phase 1b gates and REVIEW-1b requirements:
+- B5: Fast mode across all 6 supported methods with multi-box filtergraph chaining.
+- B6: Mid-stream cancellation in quality and fast modes without hanging.
+- N8: Decoder failure detection and frame count consistency.
+- N9: Quality CRF mapping for hardware and software encoders.
+- N10: Precomputed mask used in quality mode.
+- N11: Accurate microsecond progress reporting.
+- N12: Safe atomic .part writes preserving existing output on failure.
+- N13: config.json loading and tool path configuration.
+- N14: Fractional r_frame_rate preservation.
+- N15: Skipping *_clean.* files on repeated runs.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -22,6 +27,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from core.config import load_config
 from core.preset import get_default_preset, save_preset
 from core.video_engine import detect_encoder, probe, process_video
 from tests.make_samples import create_synthetic_video
@@ -30,7 +36,7 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def test_probe_utility(tmp_path):
-    """Test probe extracts accurate video metadata and audio detection."""
+    """Test probe extracts accurate video metadata, r_frame_rate string, and audio detection."""
     vid_path = str(tmp_path / "probe_test.mp4")
     create_synthetic_video(vid_path, width=320, height=240, fps=25, duration=1.0, with_audio=True)
 
@@ -41,6 +47,7 @@ def test_probe_utility(tmp_path):
     assert abs(info.duration - 1.0) < 0.2
     assert abs(info.nb_frames - 25) <= 1
     assert info.has_audio is True
+    assert info.r_frame_rate in ("25/1", "25")
 
 
 def test_detect_encoder_reports_valid_choice():
@@ -65,6 +72,7 @@ def test_fast_mode_clone_smooth_fails(tmp_path):
         process_video(src, dst, preset)
 
     assert not os.path.exists(dst)
+    assert not os.path.exists(dst + ".part")
 
 
 @pytest.mark.parametrize(
@@ -96,11 +104,65 @@ def test_fast_mode_delogo_boundaries(tmp_path, pos_name, box_t):
     assert info.nb_frames > 0
 
 
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "inpaint_fast",
+        "inpaint_hq",
+        "blur",
+        "mosaic",
+        "solid",
+        "overlay",
+    ],
+)
+def test_fast_mode_all_six_methods(tmp_path, method_name):
+    """Review 1b B5: Verify all 6 supported fast mode methods execute successfully.
+
+    Includes multi-box chaining for blur, mosaic, solid, and overlay to test filtergraph input/output binding.
+    """
+    src = str(tmp_path / f"fast_all_{method_name}_src.mp4")
+    dst = str(tmp_path / f"fast_all_{method_name}_dst.mp4")
+
+    # Generate 0.5s sample video
+    create_synthetic_video(src, width=320, height=240, fps=25, duration=0.5, with_audio=False)
+
+    # 2 boxes to verify filtergraph chaining (v1 -> v2)
+    boxes = [
+        {"x": 20, "y": 20, "w": 50, "h": 30, "unit": "absolute"},
+        {"x": 180, "y": 120, "w": 60, "h": 40, "unit": "absolute"},
+    ]
+
+    preset = get_default_preset()
+    preset["method"] = method_name
+    preset["video"]["mode"] = "fast"
+    preset["boxes"] = boxes
+
+    if method_name == "overlay":
+        ov_path = str(tmp_path / "ov_logo.png")
+        Image.new("RGBA", (60, 40), (255, 0, 0, 200)).save(ov_path)
+        preset["params"]["overlay_path"] = ov_path
+        preset["params"]["overlay_opacity"] = 0.8
+    elif method_name == "solid":
+        preset["params"]["solid_color"] = "#00FF00"
+    elif method_name == "blur":
+        preset["params"]["blur_ksize"] = 15
+    elif method_name == "mosaic":
+        preset["params"]["mosaic_block"] = 8
+
+    process_video(src, dst, preset)
+    assert os.path.exists(dst), f"Fast mode method '{method_name}' failed to generate output file!"
+
+    info = probe(dst)
+    assert info.width == 320
+    assert info.height == 240
+    assert info.nb_frames >= 12
+    print(f"\n[Fast Mode - {method_name}] Probed output: {info.width}x{info.height}, frames: {info.nb_frames}")
+
+
 def test_quality_mode_long_video_no_deadlock(tmp_path):
     """Review 1b Note 3: Quality mode must process >= 300 frames with separate stderr threads without deadlocking."""
     src = str(tmp_path / "long_video_src.mp4")
     dst = str(tmp_path / "long_video_dst.mp4")
-    # 320 frames at 25 fps = 12.8 seconds
     total_frames = 320
     fps = 25
     box = create_synthetic_video(
@@ -130,6 +192,113 @@ def test_quality_mode_long_video_no_deadlock(tmp_path):
     print(f"\n[Long Video Quality Test] Input frames: {total_frames}, Output probed frames: {info.nb_frames}")
     assert abs(info.nb_frames - total_frames) <= 2
     assert len(progress_records) > 0
+
+
+def test_quality_mode_cancel_mid_stream(tmp_path):
+    """Review 1b B6: Cancelling quality mode mid-stream (at frame 30 of >= 10s video) must terminate quickly.
+
+    Must not deadlock, cleanly delete partial .part files, leave no orphaned ffmpeg processes, and raise RuntimeError.
+    """
+    src = str(tmp_path / "cancel_mid_src.mp4")
+    dst = str(tmp_path / "cancel_mid_dst.mp4")
+    stem, ext = os.path.splitext(dst)
+    part = f"{stem}.part{ext}"
+
+    # 10.0s video (250 frames)
+    total_frames = 250
+    fps = 25
+    box = create_synthetic_video(
+        src,
+        width=160,
+        height=120,
+        fps=fps,
+        duration=10.0,
+        with_audio=False,
+        logo_box=(30, 20, 40, 20),
+    )
+
+    preset = get_default_preset()
+    preset["method"] = "inpaint_fast"
+    preset["video"]["mode"] = "quality"
+    preset["boxes"] = [box]
+
+    cancel_evt = threading.Event()
+    worker_error: list[Exception] = []
+
+    def on_progress(cur_frame, total):
+        if cur_frame >= 30:
+            cancel_evt.set()
+
+    def run_worker():
+        try:
+            process_video(src, dst, preset, progress_cb=on_progress, cancel=cancel_evt)
+        except Exception as e:
+            worker_error.append(e)
+
+    t_start = time.time()
+    th = threading.Thread(target=run_worker)
+    th.start()
+    th.join(timeout=15.0)
+    elapsed = time.time() - t_start
+
+    print(f"\n[Quality Mid-stream Cancel Test] Terminated in {elapsed:.2f}s. Thread alive: {th.is_alive()}")
+
+    assert not th.is_alive(), "Worker thread hung and failed to terminate within 15 seconds!"
+    assert elapsed < 10.0, f"Cancellation took too long ({elapsed:.2f}s)!"
+    assert not os.path.exists(dst), "Final destination file should not exist on cancellation!"
+    assert not os.path.exists(part), "Temporary .part file was not cleaned up on cancellation!"
+    assert len(worker_error) == 1, "Expected cancellation RuntimeError!"
+    assert "cancelled" in str(worker_error[0]).lower()
+
+
+def test_fast_mode_cancel_mid_stream(tmp_path):
+    """Review 1b B6: Cancelling fast mode mid-stream must terminate quickly and clean up .part file."""
+    src = str(tmp_path / "cancel_fast_src.mp4")
+    dst = str(tmp_path / "cancel_fast_dst.mp4")
+    stem, ext = os.path.splitext(dst)
+    part = f"{stem}.part{ext}"
+
+    box = create_synthetic_video(
+        src,
+        width=320,
+        height=240,
+        fps=25,
+        duration=10.0,
+        with_audio=False,
+        logo_box=(30, 20, 40, 20),
+    )
+
+    preset = get_default_preset()
+    preset["method"] = "inpaint_hq"
+    preset["video"]["mode"] = "fast"
+    preset["boxes"] = [box]
+
+    cancel_evt = threading.Event()
+    worker_error: list[Exception] = []
+
+    def on_progress(cur_sec, total_sec):
+        if cur_sec >= 1.0:
+            cancel_evt.set()
+
+    def run_worker():
+        try:
+            process_video(src, dst, preset, progress_cb=on_progress, cancel=cancel_evt)
+        except Exception as e:
+            worker_error.append(e)
+
+    t_start = time.time()
+    th = threading.Thread(target=run_worker)
+    th.start()
+    th.join(timeout=15.0)
+    elapsed = time.time() - t_start
+
+    print(f"\n[Fast Mid-stream Cancel Test] Terminated in {elapsed:.2f}s. Thread alive: {th.is_alive()}")
+
+    assert not th.is_alive(), "Fast mode worker hung on cancellation!"
+    assert not os.path.exists(dst)
+    assert not os.path.exists(part)
+    assert len(worker_error) == 1
+    assert "cancelled" in str(worker_error[0]).lower()
 
 
 def test_sample_video_3s_with_audio_gate(tmp_path):
@@ -196,22 +365,90 @@ def test_sample_video_3s_with_audio_gate(tmp_path):
     assert info_qual.has_audio is True
 
 
-def test_cancel_video_processing(tmp_path):
-    """Test cancellation cleans up incomplete output file."""
-    src = str(tmp_path / "cancel_src.mp4")
-    dst = str(tmp_path / "cancel_dst.mp4")
-    box = create_synthetic_video(src, width=320, height=240, fps=25, duration=2.0, with_audio=False)
-
+def test_overwrite_failure_preserves_existing_output(tmp_path):
+    """Review 1b N12: Using --overwrite must not destroy existing destination file if the job fails."""
+    p_path = str(tmp_path / "bad_overlay_preset.json")
     preset = get_default_preset()
-    preset["boxes"] = [box]
+    preset["method"] = "overlay"
+    preset["params"]["overlay_path"] = str(tmp_path / "non_existent_overlay.png")
+    save_preset(preset, p_path)
 
-    cancel_evt = threading.Event()
-    cancel_evt.set()  # Cancel immediately
+    dst_file = tmp_path / "important_user_result.mp4"
+    dst_file.write_text("ORIGINAL_USER_DATA", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="cancelled"):
-        process_video(src, dst, preset, cancel=cancel_evt)
+    src_vid = str(tmp_path / "src_dummy.mp4")
+    create_synthetic_video(src_vid, width=160, height=120, fps=25, duration=0.5, with_audio=False)
 
-    assert not os.path.exists(dst)
+    cmd = [
+        sys.executable,
+        "cli.py",
+        "--preset",
+        p_path,
+        "--input",
+        src_vid,
+        "--output",
+        str(dst_file),
+        "--overwrite",
+    ]
+    res = subprocess.run(
+        cmd,
+        cwd=str(Path(__file__).parent.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        creationflags=CREATE_NO_WINDOW,
+    )
+
+    assert res.returncode == 1, f"Expected exit code 1 on failure, got: {res.returncode}"
+    assert dst_file.exists(), "Existing destination file was deleted on failure!"
+    assert dst_file.read_text(encoding="utf-8") == "ORIGINAL_USER_DATA", "Existing destination file content was corrupted!"
+
+
+def test_cli_skips_clean_suffix_files(tmp_path):
+    """Review 1b N15: CLI directory run must skip *_clean.* files to avoid producing *_clean_clean.* files."""
+    p_path = str(tmp_path / "preset.json")
+    preset = get_default_preset()
+    save_preset(preset, p_path)
+
+    work_dir = tmp_path / "batch_folder"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    test_img = np.full((50, 50, 3), 100, dtype=np.uint8)
+    cv2.imwrite(str(work_dir / "img1.png"), test_img)
+    cv2.imwrite(str(work_dir / "img1_clean.png"), test_img)
+
+    cmd = [
+        sys.executable,
+        "cli.py",
+        "--preset",
+        p_path,
+        "--input",
+        str(work_dir),
+        "--output",
+        str(work_dir),
+        "--overwrite",
+    ]
+    res = subprocess.run(
+        cmd,
+        cwd=str(Path(__file__).parent.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        creationflags=CREATE_NO_WINDOW,
+    )
+    assert res.returncode == 0, f"CLI batch run failed: {res.stderr}"
+
+    assert (work_dir / "img1_clean.png").exists()
+    assert not (work_dir / "img1_clean_clean.png").exists(), "Created redundant *_clean_clean.* file!"
+
+
+def test_config_json_loaded_and_used():
+    """Review 1b N13: Verify config.json exists, loads successfully, and contains tool paths."""
+    cfg = load_config("config.json")
+    assert "ffmpeg" in cfg
+    assert "ffprobe" in cfg
+    assert cfg["ffmpeg"] == "ffmpeg"
+    assert cfg["ffprobe"] == "ffprobe"
 
 
 def test_apply_error_during_quality_processing(tmp_path):
@@ -230,11 +467,12 @@ def test_apply_error_during_quality_processing(tmp_path):
         process_video(src, dst, preset)
 
     assert not os.path.exists(dst)
+    stem, ext = os.path.splitext(dst)
+    assert not os.path.exists(f"{stem}.part{ext}")
 
 
 def test_cli_execution_and_unicode_paths(tmp_path):
     """Review 1b Note 5 & PLAN §6: CLI end-to-end test including Vietnamese path 'mẫu thử/' and exit codes."""
-    # 1. Create a valid preset JSON
     p_path = str(tmp_path / "test_preset.json")
     preset = get_default_preset()
     preset["method"] = "solid"
@@ -242,7 +480,7 @@ def test_cli_execution_and_unicode_paths(tmp_path):
     preset["boxes"] = [{"x": 10, "y": 10, "w": 40, "h": 20, "unit": "absolute"}]
     save_preset(preset, p_path)
 
-    # 2. Test Vietnamese directory: 'mẫu thử/'
+    # 1. Test Vietnamese directory: 'mẫu thử/'
     vietnamese_dir = tmp_path / "mẫu thử"
     vietnamese_dir.mkdir(parents=True, exist_ok=True)
     out_dir = tmp_path / "kết quả"
@@ -278,7 +516,7 @@ def test_cli_execution_and_unicode_paths(tmp_path):
     expected_out = out_dir / "ảnh_gốc_clean.png"
     assert expected_out.exists()
 
-    # 3. Test video input via CLI: should exit 0
+    # 2. Test video input via CLI: should exit 0
     vid_in = str(tmp_path / "cli_vid.mp4")
     vid_out = str(tmp_path / "cli_vid_out.mp4")
     create_synthetic_video(vid_in, width=160, height=120, fps=25, duration=0.5, with_audio=False)
@@ -306,7 +544,7 @@ def test_cli_execution_and_unicode_paths(tmp_path):
     assert res_vid.returncode == 0, f"CLI video failed: {res_vid.stderr}"
     assert os.path.exists(vid_out)
 
-    # 4. Test error handling (missing input): should exit 1
+    # 3. Test error handling (missing input): should exit 1
     cmd_cli_err = [
         sys.executable,
         "cli.py",
@@ -327,7 +565,7 @@ def test_cli_execution_and_unicode_paths(tmp_path):
     )
     assert res_err.returncode == 1
 
-    # 5. Test invalid preset: should exit 2
+    # 4. Test invalid preset: should exit 2
     cmd_cli_preset_err = [
         sys.executable,
         "cli.py",

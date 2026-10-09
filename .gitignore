@@ -13,3 +13,6 @@ tools/
 
 # File sinh ra khi thử GUI
 scripts/samples/
+
+# Model AI tải về bằng download_model.bat (~200 MB) — không commit
+models/

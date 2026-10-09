@@ -1,0 +1,7 @@
+# Dùng THAY cho requirements.txt khi có GPU NVIDIA: inpaint_ai chạy CUDA, nhanh hơn CPU khoảng 10 lần.
+# Không cài chung với gói onnxruntime (bản CPU) — hai gói trùng module, sẽ xung đột.
+# Gói [cuda,cudnn] tự kéo thư viện CUDA qua pip (~2 GB), không cần cài CUDA Toolkit.
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=9.1.0
+onnxruntime-gpu[cuda,cudnn]>=1.20

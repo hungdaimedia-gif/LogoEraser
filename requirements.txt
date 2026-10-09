@@ -1,3 +1,5 @@
 opencv-python>=4.8.0
 numpy>=1.24.0
 pillow>=9.1.0
+# AI inpaint (inpaint_ai). Có GPU NVIDIA thì dùng requirements-gpu.txt thay dòng này.
+onnxruntime>=1.17

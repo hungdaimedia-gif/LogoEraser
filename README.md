@@ -52,6 +52,7 @@ Menu **Preset** dùng để lưu/mở cấu hình (Ctrl+S / Ctrl+L). File preset
 
 | Phương thức | Cách làm | Hợp với |
 |---|---|---|
+| `inpaint_ai` ⭐ | Mô hình AI **LaMa** dựng lại vân và cạnh của nền (chạy offline) | **Đẹp nhất**: nền có vân (vải, chiếu, tóc, mặt đường) |
 | `inpaint_hq` | Trộn hai thuật toán inpaint của OpenCV (Telea + Navier–Stokes). Vùng lớn có thêm một lượt xử lý ở nửa độ phân giải. | Mặc định, logo trên nền mượt |
 | `inpaint_fast` | Inpaint Telea, nhanh hơn | Logo nhỏ, video dài |
 | `clone_smooth` | Lấy mảng nền bên cạnh dán đè (seamless clone) | Nền có vân lặp (tường, vải, cỏ) |
@@ -62,11 +63,19 @@ Menu **Preset** dùng để lưu/mở cấu hình (Ctrl+S / Ctrl+L). File preset
 
 Tham số chung: `dilate` nới rộng vùng ra thêm vài pixel, `feather` làm mềm mép vùng.
 
+### Phương thức AI (`inpaint_ai`)
+
+So với `inpaint_hq`, AI không kéo màu từ mép vào giữa mà vẽ lại vân và cạnh của nền, nên không để lại mảng nhoè hay vệt hình chữ X.
+
+1. Chạy `download_model.bat` một lần để tải `models\lama_fp32.onnx` (khoảng 200 MB, giấy phép Apache-2.0). Sau đó ứng dụng chạy hoàn toàn offline.
+2. Tốc độ: khoảng 1.3 giây cho mỗi vùng logo trên CPU. Có GPU NVIDIA thì cài `requirements-gpu.txt` thay cho `requirements.txt`, còn khoảng 0.13 giây (đo trên RTX 3060 Ti). Không có GPU thì ứng dụng tự chạy bằng CPU.
+3. Với video, chỉ dùng được chế độ **quality**. Ứng dụng tự làm mịn theo thời gian khi nền đứng yên, để vùng đã xoá không nhấp nháy giữa các khung.
+
 ## Video: hai chế độ
 
 | Chế độ | Cách chạy | Ghi chú |
 |---|---|---|
-| **fast** | Một lệnh FFmpeg với bộ lọc (`delogo`, `boxblur`, `drawbox`, `overlay`) | Rất nhanh. `inpaint_*` dùng `delogo` của FFmpeg. **Không hỗ trợ `clone_smooth`.** |
+| **fast** | Một lệnh FFmpeg với bộ lọc (`delogo`, `boxblur`, `drawbox`, `overlay`) | Rất nhanh. `inpaint_hq`/`inpaint_fast` dùng `delogo` của FFmpeg (hay để lại mảng kẻ ô nhoè). **Không hỗ trợ `clone_smooth`, `inpaint_ai`.** |
 | **quality** | Đọc từng khung hình, xử lý bằng đúng thuật toán của ảnh, rồi mã hoá lại | Chậm hơn nhưng kết quả giống hệt xử lý ảnh |
 
 Bộ mã hoá `auto` tự dò theo thứ tự NVIDIA NVENC → Intel QSV → AMD AMF → libx264, chạy thử thật trước khi chọn. Âm thanh được giữ nguyên (copy). `crf` (0–51, càng nhỏ càng đẹp) được áp dụng cho cả bộ mã hoá phần cứng.
@@ -135,7 +144,8 @@ build_exe.bat
 Cấu trúc:
 
 ```
-core/      preset, image_engine (7 phương thức), video_engine (FFmpeg), batch (dùng chung CLI + GUI), config
+core/      preset, image_engine (8 phương thức), ai_inpaint (LaMa/ONNX), video_engine (FFmpeg), batch (dùng chung CLI + GUI), config, fsutil
+models/    model AI (tải bằng download_model.bat, không commit)
 gui/       app (cửa sổ chính), canvas (vẽ vùng, zoom, xem trước), state (logic thuần, không phụ thuộc Tk), theme
 cli.py     dòng lệnh
 main.py    mở giao diện

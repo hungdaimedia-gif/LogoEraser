@@ -14,6 +14,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from core.fsutil import remove_part_file, replace_retry
 from core.image_engine import apply
 from core.preset import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, to_abs_box
 from core.video_engine import process_video
@@ -88,14 +89,10 @@ def process_image_file(src: str, dst: str, preset: dict) -> None:
     part_dst = part_path_for(dst)
     try:
         write_image_safe(part_dst, out)
-        os.replace(part_dst, dst)
+        replace_retry(part_dst, dst)
     finally:
         # Chỉ dọn file .part do chính job này vừa tạo, không đụng dst cũ.
-        if os.path.exists(part_dst):
-            try:
-                os.remove(part_dst)
-            except OSError:
-                pass
+        remove_part_file(part_dst)
 
 
 def process_file(
@@ -138,9 +135,4 @@ def process_file(
             ffprobe=ffprobe,
         )
     finally:
-        part = part_path_for(dst)
-        if os.path.exists(part):
-            try:
-                os.remove(part)
-            except OSError:
-                pass
+        remove_part_file(part_path_for(dst))

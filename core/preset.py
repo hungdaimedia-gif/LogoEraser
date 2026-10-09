@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # Thứ tự cố định để ô chọn phương thức trên GUI không đổi chỗ mỗi lần mở
 # (set của Python không giữ thứ tự giữa các lần chạy).
 SUPPORTED_METHODS: tuple[str, ...] = (
+    "inpaint_ai",
     "inpaint_hq",
     "inpaint_fast",
     "clone_smooth",
@@ -24,6 +25,9 @@ SUPPORTED_METHODS: tuple[str, ...] = (
     "overlay",
 )
 VALID_METHODS = frozenset(SUPPORTED_METHODS)
+
+# Method không có bộ lọc FFmpeg tương ứng ⇒ video phải chạy chế độ quality.
+FAST_UNSUPPORTED_METHODS = frozenset({"clone_smooth", "inpaint_ai"})
 
 # Nguồn duy nhất cho đuôi file — CLI, GUI và core/batch.py đều import từ đây.
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})

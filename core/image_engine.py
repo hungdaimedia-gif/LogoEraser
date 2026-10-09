@@ -391,6 +391,11 @@ def apply_with_mask(
         radius = int(params.get("radius", 5))
         return _inpaint_hq(img, mask, clean_boxes, radius=radius)
 
+    if method == "inpaint_ai":
+        from core.ai_inpaint import inpaint_lama  # nạp onnxruntime chỉ khi cần
+
+        return inpaint_lama(img, mask, clean_boxes)
+
     if method == "clone_smooth":
         dilate = int(params.get("dilate", 3))
         feather = int(params.get("feather", 4))

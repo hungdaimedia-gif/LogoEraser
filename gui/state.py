@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from core.preset import (
+    FAST_UNSUPPORTED_METHODS,
     IMAGE_EXTENSIONS,
     SUPPORTED_METHODS,
     VIDEO_EXTENSIONS,
@@ -169,7 +170,7 @@ class GuiState:
         # (mọi method trừ overlay — overlay dán đúng khung box).
         if self.method in ("inpaint_fast", "inpaint_hq"):
             return ["dilate", "feather", "radius"]
-        if self.method == "clone_smooth":
+        if self.method in ("clone_smooth", "inpaint_ai"):
             return ["dilate", "feather"]
         if self.method == "blur":
             return ["dilate", "feather", "blur_ksize"]
@@ -238,11 +239,17 @@ class GuiState:
 
         # Review 1b-r2 Note 4: clone_smooth + fast video mode forbidden
         has_videos = any(os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS for f in self.files)
-        if has_videos and self.method == "clone_smooth" and self.video_mode == "fast":
+        if has_videos and self.method in FAST_UNSUPPORTED_METHODS and self.video_mode == "fast":
             errors.append(
-                "Phương thức 'clone_smooth' không hỗ trợ chế độ 'fast' trên video. "
+                f"Phương thức '{self.method}' không hỗ trợ chế độ 'fast' trên video. "
                 "Vui lòng chuyển chế độ video sang 'quality' hoặc chọn phương thức khác."
             )
+
+        if self.method == "inpaint_ai":
+            from core.ai_inpaint import missing_model_message, model_available
+
+            if not model_available():
+                errors.append(missing_model_message())
 
         # Overlay file check
         if self.method == "overlay":

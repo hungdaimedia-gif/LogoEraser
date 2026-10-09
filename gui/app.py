@@ -22,7 +22,8 @@ import numpy as np
 from core import __version__
 from core.batch import is_clean_output, media_kind, output_path_for, process_file, read_image_safe
 from core.config import check_tools, load_config, tool_path
-from core.preset import SUPPORTED_METHODS, validate_preset
+from core.ai_inpaint import model_available
+from core.preset import FAST_UNSUPPORTED_METHODS, SUPPORTED_METHODS, validate_preset
 from core.video_engine import extract_frame
 from gui.canvas import ImageCanvas
 from gui.state import GuiState
@@ -222,7 +223,7 @@ class LogoEraserApp(ttk.Frame):
             method_group,
             textvariable=self.warning_lbl_var,
             style="Warning.TLabel",
-            wraplength=280,
+            wraplength=self._px(280),
         )
 
         # 2. Dynamic Parameters Group
@@ -393,8 +394,13 @@ class LogoEraserApp(ttk.Frame):
                 frame.pack_forget()
 
         # Warning banner for clone_smooth + fast video mode
-        if self.state.method == "clone_smooth" and self.video_mode_var.get() == "fast":
-            self.warning_lbl_var.set("⚠ clone_smooth không hỗ trợ video chế độ fast. Vui lòng chuyển sang quality!")
+        warning = ""
+        if self.state.method in FAST_UNSUPPORTED_METHODS and self.video_mode_var.get() == "fast":
+            warning = f"⚠ {self.state.method} không hỗ trợ video chế độ fast. Vui lòng chuyển sang quality!"
+        if self.state.method == "inpaint_ai" and not model_available():
+            warning = "⚠ Chưa có model AI (models\\lama_fp32.onnx) — chạy download_model.bat."
+        if warning:
+            self.warning_lbl_var.set(warning)
             self.warning_lbl.pack(fill=tk.X, pady=(4, 0))
         else:
             self.warning_lbl_var.set("")

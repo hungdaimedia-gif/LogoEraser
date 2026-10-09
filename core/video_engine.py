@@ -20,7 +20,9 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from core.fsutil import remove_part_file, replace_retry
 from core.image_engine import apply_with_mask, build_mask
+from core.preset import FAST_UNSUPPORTED_METHODS
 from core.preset import to_abs_box, validate_preset
 
 logger = logging.getLogger(__name__)
@@ -334,9 +336,9 @@ def _process_video_fast(
     ffmpeg: str,
 ) -> None:
     """Execute fast mode via a single FFmpeg process with filtergraphs."""
-    # Review 1b Note 1: clone_smooth is not supported in fast mode
-    if method == "clone_smooth":
-        raise ValueError("clone_smooth is not supported in fast mode. Please use quality mode.")
+    # Review 1b Note 1: clone_smooth / inpaint_ai không có bộ lọc FFmpeg tương ứng
+    if method in FAST_UNSUPPORTED_METHODS:
+        raise ValueError(f"{method} is not supported in fast mode. Please use quality mode.")
 
     # Review 1b N12: Write to temporary .part file to avoid corrupting/overwriting existing dst on failure
     stem, ext = os.path.splitext(dst)
@@ -489,28 +491,26 @@ def _process_video_fast(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            if os.path.exists(part_path):
-                try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
+            remove_part_file(part_path)
         else:
             proc.wait()
         t_err.join(timeout=2.0)
 
     if cancelled or (cancel and cancel.is_set()):
-        if os.path.exists(part_path):
-            os.remove(part_path)
+        remove_part_file(part_path)
         raise RuntimeError("Video processing was cancelled.")
 
     if proc.returncode != 0:
-        if os.path.exists(part_path):
-            os.remove(part_path)
+        remove_part_file(part_path)
         last_err = "".join(stderr_lines[-20:])
         raise RuntimeError(f"FFmpeg fast mode failed (exit code {proc.returncode}):\n{last_err}")
 
     # Success: atomically move part file to final destination (Review 1b N12)
-    os.replace(part_path, dst)
+    try:
+        replace_retry(part_path, dst)
+    except Exception:
+        remove_part_file(part_path)
+        raise
 
 
 def _process_video_quality(
@@ -528,6 +528,13 @@ def _process_video_quality(
     ffmpeg: str,
 ) -> None:
     """Execute quality mode via piped raw video frames processed by image_engine."""
+    # Thiếu model AI ⇒ báo trước khi mở pipe FFmpeg
+    if method == "inpaint_ai":
+        from core.ai_inpaint import missing_model_message, model_available
+
+        if not model_available():
+            raise FileNotFoundError(missing_model_message())
+
     # Pre-validate overlay asset exists before opening FFmpeg pipes (Review 1b Note 4)
     if method == "overlay":
         ov_path = params.get("overlay_path")
@@ -616,6 +623,13 @@ def _process_video_quality(
     feather = int(params.get("feather", 4))
     mask = build_mask((info.height, info.width), abs_boxes, dilate=dilate, feather=feather)
 
+    # AI dựng lại vùng hơi khác nhau mỗi khung ⇒ làm mịn theo thời gian để bớt nhấp nháy
+    stabilizer = None
+    if method == "inpaint_ai":
+        from core.ai_inpaint import TemporalStabilizer
+
+        stabilizer = TemporalStabilizer(mask)
+
     frame_size = info.width * info.height * 3
     frame_idx = 0
     total_frames = info.nb_frames if info.nb_frames > 0 else int(round(info.duration * info.fps))
@@ -640,6 +654,8 @@ def _process_video_quality(
             # Review 1b Note 4: apply error halts job and cleans up corrupt output
             try:
                 processed = apply_with_mask(frame, mask, abs_boxes, method, params)
+                if stabilizer is not None:
+                    processed = stabilizer.step(frame, processed)
             except Exception as apply_exc:
                 aborted_early = True
                 raise apply_exc
@@ -688,11 +704,7 @@ def _process_video_quality(
                     p.kill()
                     p.wait()
 
-            if os.path.exists(part_path):
-                try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
+            remove_part_file(part_path)
         else:
             # Normal completion
             if enc_proc.stdin:
@@ -713,20 +725,17 @@ def _process_video_quality(
         t_enc_err.join(timeout=2.0)
 
     if cancelled or (cancel and cancel.is_set()):
-        if os.path.exists(part_path):
-            os.remove(part_path)
+        remove_part_file(part_path)
         raise RuntimeError("Video processing was cancelled.")
 
     # Review 1b N8: Verify both decoder and encoder exit codes
     if dec_proc.returncode not in (0, None):
-        if os.path.exists(part_path):
-            os.remove(part_path)
+        remove_part_file(part_path)
         err_msg = "".join(dec_err_lines[-20:])
         raise RuntimeError(f"FFmpeg decoder failed (code {dec_proc.returncode}):\n{err_msg}")
 
     if enc_proc.returncode != 0:
-        if os.path.exists(part_path):
-            os.remove(part_path)
+        remove_part_file(part_path)
         err_msg = "".join(enc_err_lines[-20:])
         raise RuntimeError(f"FFmpeg quality encoder failed (code {enc_proc.returncode}):\n{err_msg}")
 
@@ -739,4 +748,8 @@ def _process_video_quality(
         )
 
     # Success: atomically move part file to final destination (Review 1b N12)
-    os.replace(part_path, dst)
+    try:
+        replace_retry(part_path, dst)
+    except Exception:
+        remove_part_file(part_path)
+        raise

@@ -33,6 +33,14 @@ if errorlevel 1 (
 rem config.json dat CANH exe de nguoi dung sua duoc duong dan ffmpeg.
 copy /y config.json release\LogoEraser\config.json >nul
 copy /y README.md release\LogoEraser\README.md >nul
+copy /y download_model.bat release\LogoEraser\download_model.bat >nul
+
+rem Model AI (inpaint_ai) dat canh exe, neu da tai.
+if exist "models\lama_fp32.onnx" (
+    if not exist "release\LogoEraser\models" mkdir "release\LogoEraser\models"
+    copy /y "models\lama_fp32.onnx" "release\LogoEraser\models\" >nul
+    echo Da dong goi kem model AI.
+)
 
 rem Neu co thu muc tools\ffmpeg (chua bin\ffmpeg.exe, bin\ffprobe.exe) thi dong goi kem.
 if exist "tools\ffmpeg\bin\ffmpeg.exe" (

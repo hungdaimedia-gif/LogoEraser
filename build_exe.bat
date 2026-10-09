@@ -36,6 +36,7 @@ rem config.json dat CANH exe de nguoi dung sua duoc duong dan ffmpeg.
 copy /y config.json release\LogoEraser\config.json >nul
 copy /y README.md release\LogoEraser\README.md >nul
 copy /y download_model.bat release\LogoEraser\download_model.bat >nul
+copy /y LICENSE release\LogoEraser\LICENSE >nul
 
 rem Model AI (inpaint_ai) dat canh exe, neu da tai.
 if exist "models\lama_fp32.onnx" (

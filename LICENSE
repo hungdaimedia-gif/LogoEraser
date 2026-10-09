@@ -1,0 +1,36 @@
+LogoEraser
+Copyright (c) 2026 hungdaimedia. All rights reserved.
+
+© hungdaimedia, All rights reserved.
+
+Phần mềm này (mã nguồn, bản thực thi, giao diện và tài liệu) thuộc quyền sở hữu
+của hungdaimedia. Không được sao chép, sửa đổi, phân phối lại, bán, cho thuê,
+dịch ngược (decompile/reverse engineer) toàn bộ hay một phần phần mềm khi chưa
+có sự cho phép bằng văn bản của hungdaimedia.
+
+Người dùng chịu trách nhiệm đảm bảo mình có quyền chỉnh sửa nội dung (ảnh,
+video) được xử lý bằng phần mềm này.
+
+PHẦN MỀM ĐƯỢC CUNG CẤP "NGUYÊN TRẠNG", KHÔNG KÈM BẤT KỲ BẢO ĐẢM NÀO. hungdaimedia
+không chịu trách nhiệm về bất kỳ thiệt hại nào phát sinh từ việc sử dụng phần mềm.
+
+---
+
+This software (source code, binaries, user interface and documentation) is the
+property of hungdaimedia. No part of it may be copied, modified, redistributed,
+sold, sublicensed or reverse engineered without prior written permission from
+hungdaimedia. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+---
+
+Thành phần bên thứ ba / Third-party components
+(giữ nguyên giấy phép gốc của từng thành phần — không thuộc phạm vi điều khoản trên)
+
+- OpenCV ............................ Apache License 2.0
+- NumPy ............................. BSD 3-Clause License
+- Pillow ............................ MIT-CMU License
+- ONNX Runtime ...................... MIT License
+- LaMa inpainting model (ONNX export
+  by Carve/LaMa-ONNX) ............... Apache License 2.0
+- NVIDIA CUDA / cuDNN runtime (bản GPU) NVIDIA EULA
+- FFmpeg (cài riêng, không đóng gói) LGPL 2.1+ / GPL 2+

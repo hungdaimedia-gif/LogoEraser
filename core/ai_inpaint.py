@@ -178,3 +178,124 @@ class TemporalStabilizer:
         self.prev_in = frame_in
         self.prev_out = result
         return result
+
+
+def _fill_flow(flow: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
+    """Lấp luồng quang học bên trong vùng logo bằng chuyển động của nền xung quanh.
+
+    Logo đứng yên nên flow đo được trong lỗ ≈ 0 (sai). Dùng nội suy chuẩn hoá
+    (normalized convolution) nhiều tầng: tầng nhỏ giữ chi tiết sát mép, tầng lớn
+    phủ tới tâm lỗ.
+    """
+    v = valid.astype(np.float32)
+    out = flow.copy()
+    need = ~valid
+    for s in (sigma * 0.5, sigma, sigma * 2.0):
+        k = int(s * 3) | 1
+        num = cv2.GaussianBlur(flow * v[..., None], (k, k), s)
+        den = cv2.GaussianBlur(v, (k, k), s)[..., None]
+        ok = (den[..., 0] > 1e-3) & need
+        out[ok] = (num / np.maximum(den, 1e-6))[ok]
+        v = np.where(ok, 1.0, v).astype(np.float32)
+        flow = out
+        need = need & ~ok
+        if not need.any():
+            break
+    return out
+
+
+class FlowStabilizer:
+    """Giữ vùng đã xoá ổn định theo thời gian bằng luồng quang học (optical flow).
+
+    AI vẽ lại vùng logo độc lập ở từng khung ⇒ khi có vật đi qua (chuôi kiếm, bàn
+    tay) chi tiết bị "sôi". Ở mỗi khung: đo chuyển động của nền quanh logo, lấp
+    chuyển động vào bên trong lỗ, kéo kết quả khung trước theo chuyển động đó rồi
+    trộn với kết quả AI của khung hiện tại. Phần trộn AI mới ở mỗi khung ngăn sai
+    số tích luỹ; khi cảnh đổi đột ngột (cắt cảnh) thì bỏ trộn.
+
+    Ý tưởng "lan truyền theo flow + lấp phần còn lại" giống E2FGVI/ProPainter nhưng
+    chỉ dùng OpenCV (DIS optical flow), chạy được trên CPU.
+
+    Thông số chọn bằng mắt trên video Veo thật (kiếm đi qua vùng logo, 2026-10-09):
+    giữ 90% khung trước ⇒ kiếm thành bóng ma mờ; 75% + chặn chỗ chênh lệch lớn
+    (detail_tolerance) ⇒ kiếm sắc như bản thô, phần nền "sôi" vẫn được làm mịn.
+    """
+
+    def __init__(
+        self,
+        mask: np.ndarray,
+        boxes_abs: list[dict],
+        keep_prev: float = 0.75,
+        cut_error: float = 20.0,
+        detail_tolerance: float = 30.0,
+        flow_source: str = "ai",
+    ) -> None:
+        h, w = mask.shape
+        self.hole = mask > 10
+        self.alpha = mask.astype(np.float32) / 255.0
+        self.keep_prev = keep_prev
+        self.cut_error = cut_error
+        self.detail_tolerance = detail_tolerance
+        self.flow_source = flow_source
+        self.windows: list[tuple[int, int, int, int, float]] = []
+        for b in boxes_abs:
+            x0, y0, cw, ch = _crop_rect(w, h, b)
+            self.windows.append((x0, y0, cw, ch, max(4.0, max(int(b["w"]), int(b["h"])) / 2.0)))
+        self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        self.prev_in: np.ndarray | None = None
+        self.prev_out: np.ndarray | None = None
+        self.prev_raw: np.ndarray | None = None
+        self.last_weights: list[float] = []
+
+    def step(self, frame_in: np.ndarray, frame_out: np.ndarray) -> np.ndarray:
+        if self.prev_in is None:
+            self.prev_in, self.prev_out, self.prev_raw = frame_in, frame_out, frame_out
+            return frame_out
+
+        result = frame_out.copy()
+        self.last_weights = []
+        for x0, y0, cw, ch, sigma in self.windows:
+            sl = (slice(y0, y0 + ch), slice(x0, x0 + cw))
+            hole = self.hole[sl]
+            if not hole.any():
+                continue
+            g1 = cv2.cvtColor(frame_in[sl], cv2.COLOR_BGR2GRAY)
+            g0 = cv2.cvtColor(self.prev_in[sl], cv2.COLOR_BGR2GRAY)
+            valid = ~cv2.dilate(hole.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+            # flow từ khung hiện tại về khung trước: pixel (x,y) ở t nằm ở (x,y)+flow ở t-1
+            if self.flow_source == "ai":
+                # Đo trên hai kết quả AI liên tiếp: vật đi qua lỗ (chuôi kiếm) đã được
+                # AI vẽ ở cả hai khung nên flow bắt đúng chuyển động riêng của vật.
+                a1 = cv2.cvtColor(frame_out[sl], cv2.COLOR_BGR2GRAY)
+                a0 = cv2.cvtColor(self.prev_raw[sl], cv2.COLOR_BGR2GRAY)
+                flow = self.dis.calc(a1, a0, None)
+            else:
+                # Lấp flow trong lỗ bằng chuyển động của nền xung quanh
+                flow = _fill_flow(self.dis.calc(g1, g0, None), valid, sigma)
+
+            gx, gy = np.meshgrid(np.arange(cw, dtype=np.float32), np.arange(ch, dtype=np.float32))
+            mx, my = gx + flow[..., 0], gy + flow[..., 1]
+            warped_out = cv2.remap(self.prev_out[sl], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            warped_in = cv2.remap(g0, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+            # Độ tin cậy: flow có giải thích được chuyển động của vành nền quanh lỗ không
+            ring = cv2.dilate(hole.astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool) & valid
+            err = float(np.abs(warped_in[ring].astype(np.float32) - g1[ring].astype(np.float32)).mean()) if ring.any() else 99.0
+            wp = 0.0 if err >= self.cut_error else self.keep_prev * (1.0 - (err / self.cut_error) ** 2)
+            self.last_weights.append(wp)
+            if wp <= 0.0:
+                continue
+
+            cur = result[sl].astype(np.float32)
+            prev = warped_out.astype(np.float32)
+            # Chỉ làm mịn dao động NHỎ (vân bị "sôi"). Chênh lệch lớn nghĩa là có vật
+            # thật đi qua (chuôi kiếm, bàn tay) bị kéo lệch ⇒ trộn vào thành bóng ma mờ.
+            # Ở đó tin kết quả AI hiện tại. So ở tần số thấp: vân "sôi" (nhiễu nhỏ) tự
+            # triệt tiêu khi làm mờ, còn vật lớn dịch chỗ vẫn cho chênh lệch lớn.
+            diff = np.abs(cv2.GaussianBlur(prev, (0, 0), 3.0) - cv2.GaussianBlur(cur, (0, 0), 3.0)).mean(axis=2)
+            agree = np.clip(1.0 - diff / self.detail_tolerance, 0.0, 1.0) ** 2
+            a = (self.alpha[sl] * wp * agree)[..., None]
+            result[sl] = np.clip(prev * a + cur * (1.0 - a), 0, 255).astype(np.uint8)
+
+        self.prev_in, self.prev_out, self.prev_raw = frame_in, result, frame_out
+        return result

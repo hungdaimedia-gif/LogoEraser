@@ -138,3 +138,60 @@ def test_temporal_stabilizer_smooths_static_scene_but_not_motion():
     out_c = moving.copy(); out_c[40:80, 60:100] = 30
     r2 = stab.step(moving, out_c)
     assert int(r2[60, 80, 0]) == 30
+
+
+def _panning_clip(n: int = 24, w: int = 320, h: int = 240, speed: int = 3) -> np.ndarray:
+    """Nền có vân trượt ngang đều (camera lia) — dữ liệu có đáp án cho từng khung."""
+    big = _woven_texture(w + n * speed + 8, h)
+    return np.stack([big[:, i * speed:i * speed + w] for i in range(n)])
+
+
+def test_flow_stabilizer_reduces_flicker_on_moving_background():
+    from core.ai_inpaint import FlowStabilizer
+
+    gt = _panning_clip()
+    n, h, w, _ = gt.shape
+    box = [{"x": 120, "y": 90, "w": 80, "h": 50, "unit": "absolute"}]
+    mask = build_mask((h, w), box, dilate=3, feather=4)
+    hole = mask > 10
+    rng = np.random.default_rng(0)
+
+    # Giả lập AI: đúng nội dung nhưng mỗi khung lệch ngẫu nhiên một chút ⇒ nhấp nháy
+    frames_in, raw = [], []
+    for g in gt:
+        logo = g.copy()
+        logo[hole] = 255
+        noisy = g.astype(np.int16)
+        noisy[hole] += rng.integers(-25, 26, size=(int(hole.sum()), 3), dtype=np.int16)
+        frames_in.append(logo)
+        raw.append(np.clip(noisy, 0, 255).astype(np.uint8))
+
+    st = FlowStabilizer(mask, box)
+    out = [st.step(a, b) for a, b in zip(frames_in, raw)]
+
+    def flicker(seq):
+        s = np.stack(seq).astype(np.float32)
+        return float(np.abs(np.diff(s, axis=0) - np.diff(gt.astype(np.float32), axis=0))[:, hole].mean())
+
+    def error(seq):
+        return float(np.abs(np.stack(seq).astype(np.float32) - gt.astype(np.float32))[:, hole].mean())
+
+    print(f"\n[flow] flicker {flicker(raw):.1f} -> {flicker(out):.1f} | error {error(raw):.1f} -> {error(out):.1f}")
+    assert flicker(out) < 0.6 * flicker(raw)
+    assert error(out) <= error(raw)  # kéo theo chuyển động đúng ⇒ không tạo bóng ma
+    assert np.array_equal(out[5][mask == 0], raw[5][mask == 0])  # ngoài vùng logo không đổi
+
+
+def test_flow_stabilizer_resets_on_scene_cut():
+    from core.ai_inpaint import FlowStabilizer
+
+    h, w = 240, 320
+    box = [{"x": 120, "y": 90, "w": 80, "h": 50, "unit": "absolute"}]
+    mask = build_mask((h, w), box, dilate=3, feather=4)
+    st = FlowStabilizer(mask, box)
+    a = _woven_texture(w, h)
+    b = np.full((h, w, 3), 30, np.uint8)  # cắt cảnh sang khung tối hoàn toàn khác
+    st.step(a, a)
+    out = st.step(b, b)
+    assert st.last_weights == [0.0]
+    assert np.array_equal(out, b)
